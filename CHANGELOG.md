@@ -104,6 +104,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - roaringbitmap
 
 ### Fixed
+- Fixed `huge_pages_status` showing `unknown` instead of `on` or `off` when
+  zero-copy I/O (`polar_enable_zero_copy`) is in use on shared storage
+  (XCOM-XXX)
 - Fixed transaction commits stalling for several seconds under heavy write
   load when the in-memory WAL queue became full (XCOM-XXX).
 
