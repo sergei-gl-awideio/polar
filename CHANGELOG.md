@@ -229,6 +229,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Performance
 
+- Interleave the main shared-memory area across available NUMA nodes on
+  multi-NUMA-node Linux servers for more predictable memory access. Explicit
+  `numactl` policies are preserved. Enabled by default with
+  `polar_shmem_numa_interleave` (XCOM-XXX)
 - Speed up WAL streaming to a shared-storage replica that has fallen
   behind: a walsender now fills each message with up to 128kB of xlog
   meta instead of the 1kB it defaulted to, so a backlog is sent in a
