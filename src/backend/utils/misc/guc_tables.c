@@ -1332,6 +1332,21 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"polar_shmem_prefault", PGC_POSTMASTER, POLAR_STORAGE,
+			gettext_noop("Enables prefaulting of the shared-memory segment at startup."),
+			gettext_noop("Faults in the whole shared-memory segment in the postmaster, "
+						 "so its NUMA placement is fixed before backends start and huge-page "
+						 "allocation and zeroing happen at startup rather than during "
+						 "queries. This lengthens startup and crash restarts for large "
+						 "segments. Only has effect when shared memory uses huge pages."),
+			GUC_NO_RESET_ALL | POLAR_GUC_IS_VISIBLE | POLAR_GUC_IS_CHANGABLE
+		},
+		&polar_shmem_prefault,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"polar_enable_debug", PGC_SIGHUP, POLAR_STORAGE,
 			gettext_noop("Enable output debug information."),
 			NULL,

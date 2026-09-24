@@ -682,6 +682,13 @@ CreateAnonymousSegment(Size *size)
 	/* Interleave the anonymous segment before anything faults it */
 	polar_shmem_numa_interleave_range(ptr, *size);
 
+	/*
+	 * Prefault the whole segment in the postmaster, under the policy just
+	 * installed, so every page's placement is decided here rather than by
+	 * whoever faults it first. Gated on huge pages inside the helper.
+	 */
+	polar_shmem_prefault_range(ptr, *size);
+
 	return ptr;
 }
 

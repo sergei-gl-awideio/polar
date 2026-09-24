@@ -236,6 +236,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   multi-NUMA-node Linux servers for more predictable memory access. Explicit
   `numactl` policies are preserved. Enabled by default with
   `polar_shmem_numa_interleave` (XCOM-XXX)
+- Prefault huge-page shared memory during startup to reduce memory-allocation
+  work during query processing. This may increase startup time, including
+  restarts after a crash, for large configurations. Enabled by default with
+  `polar_shmem_prefault` (XCOM-XXX)
 - Speed up WAL streaming to a shared-storage replica that has fallen
   behind: a walsender now fills each message with up to 128kB of xlog
   meta instead of the 1kB it defaulted to, so a backlog is sent in a
