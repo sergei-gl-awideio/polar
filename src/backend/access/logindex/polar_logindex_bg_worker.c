@@ -30,6 +30,7 @@
 #include "access/xlogrecovery.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/walwriter.h"
@@ -343,6 +344,9 @@ polar_logindex_bg_worker_main(char *startup_data, size_t startup_data_len)
 		if (flush_done && (replay_done || can_hold))
 			timeout = 10;
 
+		/* Publish this worker's SLRU counters; reporting is rate limited. */
+		pgstat_report_stat(false);
+
 		if (timeout > 0)
 		{
 			WaitLatch(MyLatch,
@@ -443,6 +447,9 @@ polar_logindex_saver_main(Datum main_arg)
 
 		/* POLAR: Save logindex data */
 		polar_logindex_primary_save(polar_logindex_redo_instance);
+
+		/* Forced saves also accumulate SLRU counters in this process. */
+		pgstat_report_stat(false);
 	}
 
 	elog(LOG, "Exit polar logindex saver");

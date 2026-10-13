@@ -2460,6 +2460,11 @@ polar_logindex_mem_tbl_size(log_index_snapshot logindex_snapshot)
 	return logindex_snapshot != NULL ? logindex_snapshot->mem_tbl_size : 0;
 }
 
+/*
+ * Read the backlog without waiting behind table writes and fsyncs.  Both
+ * counters advance under the snapshot spinlock on the writer.  Replica meta
+ * reloads can race with this sample; monitoring tolerates an approximate count.
+ */
 uint64
 polar_logindex_used_mem_tbl_size(log_index_snapshot logindex_snapshot)
 {
@@ -2467,12 +2472,21 @@ polar_logindex_used_mem_tbl_size(log_index_snapshot logindex_snapshot)
 
 	if (logindex_snapshot != NULL)
 	{
-		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_SHARED);
+		log_idx_table_id_t indexed;
+		log_idx_table_id_t saved;
+
 		SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
-		mem_tbl_size = logindex_snapshot->max_idx_table_id -
-			logindex_snapshot->meta.max_idx_table_id;
+		indexed = logindex_snapshot->max_idx_table_id;
+		saved = logindex_snapshot->meta.max_idx_table_id;
 		SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
-		LWLockRelease(LOG_INDEX_IO_LOCK);
+
+		/*
+		 * Meta can name more than this node has indexed, on a replica whose
+		 * parse is behind what the primary has saved, which is exactly when
+		 * someone is looking at this.  Unsigned, so say none rather than
+		 * eighteen quintillion.
+		 */
+		mem_tbl_size = indexed > saved ? indexed - saved : 0;
 	}
 
 	return mem_tbl_size;
