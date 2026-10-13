@@ -59,21 +59,25 @@ static log_index_snapshot test_logindex_snapshot = NULL;
 #define TEST_PUBLICATION_TABLES (LOG_INDEX_TABLE_NUM_PER_FILE + 8)
 static log_index_snapshot test_publication_snapshot = NULL;
 static pg_atomic_uint32 *refresh_worker_done;
+static bool publication_flushable = true;
+static int publication_wal_waits = 0;
 static XLogRecPtr test_max_lsn = InvalidXLogRecPtr;
 static XLogRecPtr test_start_lsn[TEST_MAX_BLOCK_NUMBER];
 static XLogRecPtr test_end_lsn[TEST_MAX_BLOCK_NUMBER];
 static XLogRecPtr test_only_two[2];
 
 static log_index_table_flushable_hook_type prev_flushable_hook = NULL;
+static bool test_publication_table_flushable(log_index_mem_table table);
 
 PGDLLEXPORT void test_logindex_bgwriter_main(Datum main_arg);
 
 static bool
 test_logindex_table_flushable(log_index_snapshot logindex_snapshot, log_index_mem_table table)
 {
-	if (strcmp(logindex_snapshot->dir, LOGINDEX_SNAPSHOT_NAME) == 0 ||
-		strcmp(logindex_snapshot->dir, "test_logindex_publication") == 0)
+	if (strcmp(logindex_snapshot->dir, LOGINDEX_SNAPSHOT_NAME) == 0)
 		return true;
+	else if (strcmp(logindex_snapshot->dir, "test_logindex_publication") == 0)
+		return test_publication_table_flushable(table);
 	else if (prev_flushable_hook)
 		return prev_flushable_hook(logindex_snapshot, table);
 	else
@@ -892,6 +896,17 @@ test_published_tid(log_index_snapshot logindex_snapshot)
 	return meta.max_idx_table_id;
 }
 
+static bool
+test_publication_table_flushable(log_index_mem_table table)
+{
+	if (publication_wal_waits > 0)
+	{
+		publication_wal_waits--;
+		return false;
+	}
+	return publication_flushable;
+}
+
 /* Readers deliberately block behind a simulated promotion below. */
 void
 test_logindex_refresh_main(Datum main_arg)
@@ -1143,6 +1158,8 @@ test_logindex_publication(void)
 	log_index_mem_table table;
 	log_index_table_bloom_t *bloom;
 	XLogRecPtr checkpoint_lsn;
+	volatile bool checkpoint_failed = false;
+	MemoryContext oldcontext = CurrentMemoryContext;
 
 	MemSet(&tag, 0, sizeof(tag));
 	tag.spcOid = 30;
@@ -1221,19 +1238,49 @@ test_logindex_publication(void)
 	polar_logindex_flush_table(logindex_snapshot, checkpoint_lsn, false);
 	Assert(test_published_tid(logindex_snapshot) == tables + 1);
 
-	/* Save one more table before testing reinitialization. */
+	/* Keep a valid inactive table waiting for WAL: background work must return. */
 	tag.blockNum++;
 	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
 						  ((XLogRecPtr) (tables + 3) << 32) + LSN_TEST_STEP);
 	table = LOG_INDEX_MEM_TBL((tables + 1) % logindex_snapshot->mem_tbl_size);
+	publication_flushable = false;
+	Assert(polar_logindex_bg_write(logindex_snapshot));
+	publication_flushable = true;
+	Assert(test_published_tid(logindex_snapshot) == tables + 1);
+
+	/* A numbering/state inconsistency must fail a checkpoint, never complete it. */
 	checkpoint_lsn = table->data.max_lsn;
+	LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FREE);
+	Assert(polar_logindex_bg_write(logindex_snapshot));
+	PG_TRY();
+	{
+		polar_logindex_flush_table(logindex_snapshot, checkpoint_lsn, false);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		checkpoint_failed = edata->sqlerrcode == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE;
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	Assert(checkpoint_failed);
+	Assert(!LWLockHeldByMe(LOG_INDEX_IO_LOCK));
+	LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_INACTIVE);
+	/* A valid table waiting for WAL must be retried before completing. */
+	publication_wal_waits = 2;
 	polar_logindex_flush_table(logindex_snapshot, checkpoint_lsn, false);
+	Assert(publication_wal_waits == 0);
 	Assert(test_published_tid(logindex_snapshot) == tables + 2);
 
 	/* Reinitialization must recover the published watermark and table contents. */
 	pg_atomic_write_u32(&logindex_snapshot->state, 0);
 	polar_logindex_snapshot_init(logindex_snapshot, checkpoint_lsn, 1, false, false);
 	Assert(logindex_snapshot->last_published_table_id == tables + 2);
+	Assert(logindex_snapshot->last_stuck_tid == LOG_INDEX_TABLE_INVALID_ID);
 	Assert(log_index_read_table_data(logindex_snapshot, disk_table, tables + 2, LOG));
 	Assert(disk_table->idx_table_id == tables + 2);
 	test_logindex_bloom_refresh_race(logindex_snapshot);

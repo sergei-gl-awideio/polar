@@ -405,6 +405,8 @@ typedef struct log_index_snapshot_t
 	/* Last table named by the meta file; protected by LOG_INDEX_IO_LOCK. */
 	log_idx_table_id_t last_published_table_id;
 
+	/* Best-effort warning suppression; concurrent updates may repeat a warning. */
+	log_idx_table_id_t last_stuck_tid;
 	log_index_mem_table_t mem_table[FLEXIBLE_ARRAY_MEMBER];
 } log_index_snapshot_t;
 

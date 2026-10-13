@@ -213,6 +213,9 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 	LWLock	   *lock;
 	log_index_meta_t *meta = &logindex_snapshot->meta;
 	uint32		mid;
+	log_idx_table_id_t next_tid;
+	log_idx_table_id_t failed_tid = LOG_INDEX_TABLE_INVALID_ID;
+	XLogRecPtr	flushed_lsn = InvalidXLogRecPtr;
 	bool		need_flush;
 	bool		succeed = true;
 	int			flushed = 0;
@@ -223,12 +226,15 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 	log_index_seg_fd_t seg_fd = LOG_INDEX_SEG_FD_EMPTY;
 
 	SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
-	mid = meta->max_idx_table_id % logindex_snapshot->mem_tbl_size;
+	next_tid = meta->max_idx_table_id + 1;
+	mid = (next_tid - 1) % logindex_snapshot->mem_tbl_size;
 	SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
 
 	do
 	{
 		log_idx_table_id_t tid = LOG_INDEX_TABLE_INVALID_ID;
+		log_idx_table_id_t previous_tid = next_tid;
+		bool		wal_blocked = false;
 		XLogRecPtr	table_min_lsn,
 					table_max_lsn;
 
@@ -293,6 +299,9 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 														   errhidecontext(true)));
 				}
 			}
+			else if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_INACTIVE ||
+					 LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_ACTIVE)
+				wal_blocked = true;
 
 			LWLockRelease(lock);
 		}
@@ -325,10 +334,47 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 		else
 			write_done = true;
 
+		next_tid = meta->max_idx_table_id + 1;
+		flushed_lsn = meta->max_lsn;
 		mid = meta->max_idx_table_id;
 		SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
 
 		mid %= logindex_snapshot->mem_tbl_size;
+
+		if (InRecovery)
+			HandleStartupProcInterrupts();
+		else
+			CHECK_FOR_INTERRUPTS();
+
+		/* Compare table ids, since a slot number can wrap while progressing. */
+		if (need_flush && next_tid == previous_tid)
+		{
+			if (!XLogRecPtrIsInvalid(checkpoint_lsn))
+			{
+				if (wal_blocked)
+				{
+					/* A checkpoint must wait for WAL durability without spinning. */
+					pg_usleep(1000L);
+					continue;
+				}
+
+				/* Close this round's descriptor before failing the checkpoint. */
+				failed_tid = next_tid;
+				break;
+			}
+
+			if (!wal_blocked && logindex_snapshot->last_stuck_tid != next_tid)
+			{
+				logindex_snapshot->last_stuck_tid = next_tid;
+				ereport(WARNING,
+						(errmsg("%s made no progress flushing logindex table %lu",
+								logindex_snapshot->dir, next_tid)));
+			}
+
+			/* Let the background caller return to its latch and shutdown checks. */
+			write_done = true;
+			break;
+		}
 	}
 	while (need_flush);
 
@@ -336,6 +382,14 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 	log_index_flush_meta(logindex_snapshot);
 
 	log_index_close_seg_fd(&seg_fd);
+
+	if (failed_tid != LOG_INDEX_TABLE_INVALID_ID)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not complete checkpoint: %s cannot flush logindex table %lu",
+						logindex_snapshot->dir, failed_tid),
+				 errdetail("Checkpoint LSN is %X/%X, but the logindex covers only %X/%X.",
+						   LSN_FORMAT_ARGS(checkpoint_lsn), LSN_FORMAT_ARGS(flushed_lsn))));
 
 	return write_done;
 }
@@ -581,6 +635,7 @@ polar_logindex_snapshot_base_init(log_index_snapshot logindex_snapshot, XLogRecP
 
 	/* Discard publication state from a previous initialization. */
 	logindex_snapshot->last_published_table_id = meta->max_idx_table_id;
+	logindex_snapshot->last_stuck_tid = LOG_INDEX_TABLE_INVALID_ID;
 
 	logindex_snapshot_init_promoted_info(logindex_snapshot);
 	logindex_snapshot->max_idx_table_id = meta->max_idx_table_id;
@@ -697,6 +752,7 @@ polar_logindex_snapshot_shmem_init(const char *name, uint64 logindex_mem_tbl_siz
 		logindex_snapshot->mem_tbl_size = logindex_mem_tbl_size;
 
 		logindex_snapshot->last_published_table_id = LOG_INDEX_TABLE_INVALID_ID;
+		logindex_snapshot->last_stuck_tid = LOG_INDEX_TABLE_INVALID_ID;
 
 		pg_atomic_init_u32(&logindex_snapshot->state, 0);
 
