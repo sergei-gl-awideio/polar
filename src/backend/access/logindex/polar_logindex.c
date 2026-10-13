@@ -1776,8 +1776,18 @@ log_index_read_seg_file(log_index_snapshot logindex_snapshot, log_table_cache_t 
 		FileClose(fd);
 	}
 
-	/* segno start from 0, while log_index_table_id_t start from 1 */
+	/* Promotion repair can leave an unpublished prefix in the first segment. */
 	cache->min_idx_table_id = segno * LOG_INDEX_TABLE_NUM_PER_FILE + 1;
+	if (meta.min_segment_info.min_idx_table_id > cache->min_idx_table_id)
+	{
+		size_t skip = (meta.min_segment_info.min_idx_table_id - cache->min_idx_table_id) * sizeof(log_index_table_t);
+
+		if (skip >= bytes)
+			return false;
+		memmove(cache->data, cache->data + skip, bytes - skip);
+		bytes -= skip;
+		cache->min_idx_table_id = meta.min_segment_info.min_idx_table_id;
+	}
 	table_data = (log_index_table_t *) cache->data;
 
 	if (table_data->idx_table_id != cache->min_idx_table_id || cache->min_idx_table_id > meta.max_idx_table_id)
@@ -1943,7 +1953,8 @@ log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table 
 				min_seg->max_lsn = Max(table->data.max_lsn, min_seg->max_lsn);
 
 				min_seg->max_idx_table_id = Max(tid, min_seg->max_idx_table_id);
-				min_seg->min_idx_table_id = min_seg->segment_no * LOG_INDEX_TABLE_NUM_PER_FILE + 1;
+				if (min_seg->min_idx_table_id == LOG_INDEX_TABLE_INVALID_ID)
+					min_seg->min_idx_table_id = tid;
 			}
 
 			if (meta->max_idx_table_id - logindex_snapshot->last_published_table_id >=
@@ -2591,6 +2602,136 @@ polar_get_logindex_snapshot_storage_min_lsn(log_index_snapshot logindex_snapshot
 	return min_lsn;
 }
 
+/*
+ * An online promotion can adopt metadata whose numbering predates the tables
+ * still in this replica's ring. The old storage owner must be fenced. Startup
+ * can still be finishing WAL parsing, so recheck each slot under its lock.
+ *
+ * Recover only the contiguous suffix ending at the active table. A FLUSHED
+ * slot can also contain a reader's cached, older table, so scanning for the
+ * smallest nonzero table id would not establish a writable sequence.
+ */
+static bool
+log_index_repair_promoted_tables(log_index_snapshot logindex_snapshot)
+{
+	log_index_meta_t *meta = &logindex_snapshot->meta;
+	log_idx_table_id_t active_tid = LOG_INDEX_MEM_TBL_TID(LOG_INDEX_MEM_TBL_ACTIVE());
+	log_idx_table_id_t first_tid = active_tid;
+	log_idx_table_id_t tid;
+	bool repaired = false;
+
+	if (active_tid <= meta->max_idx_table_id + 1)
+		return false;
+
+	while (first_tid > 1 && active_tid - first_tid + 1 < logindex_snapshot->mem_tbl_size)
+	{
+		log_index_mem_table table = LOG_INDEX_MEM_TBL((first_tid - 2) % logindex_snapshot->mem_tbl_size);
+		bool retained;
+
+		LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_SHARED);
+		retained = LOG_INDEX_MEM_TBL_TID(table) == first_tid - 1 &&
+			(LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_INACTIVE ||
+			 LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+		LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+		if (!retained)
+			break;
+		first_tid--;
+	}
+
+	if (first_tid > meta->max_idx_table_id + 1)
+	{
+		log_index_mem_table table = LOG_INDEX_MEM_TBL((first_tid - 1) % logindex_snapshot->mem_tbl_size);
+		log_index_seg_fd_t seg_fd = LOG_INDEX_SEG_FD_EMPTY;
+		log_index_file_segment_t *min_seg = &meta->min_segment_info;
+		char path[MAXPGPATH];
+		File fd;
+		int pageno = LOG_INDEX_TBL_BLOOM_PAGE_NO(first_tid);
+		LWLock *bloom_lock = SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl, pageno);
+		XLogRecPtr redo_lsn;
+		TimeLineID redo_tli;
+
+		/* Startup can still be waiting for this restartpoint at promotion. */
+		polar_request_last_restartpoint();
+		LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+		/* A record at redo can straddle tables; require an earlier start. */
+		GetOldestRestartPoint(&redo_lsn, &redo_tli);
+		if (first_tid == active_tid || LOG_INDEX_MEM_TBL_TID(table) != first_tid ||
+			(LOG_INDEX_MEM_TBL_STATE(table) != LOG_INDEX_MEM_TBL_STATE_INACTIVE &&
+			 LOG_INDEX_MEM_TBL_STATE(table) != LOG_INDEX_MEM_TBL_STATE_FLUSHED) ||
+			table->data.min_lsn >= redo_lsn ||
+			!log_index_table_flushable(logindex_snapshot, table))
+			ereport(FATAL,
+					(errmsg("cannot repair %s logindex numbering during promotion",
+							logindex_snapshot->dir),
+					 errdetail("First table %lu, active table %lu, first LSN %X/%X, checkpoint redo %X/%X, table end %X/%X, durable WAL %X/%X.",
+							first_tid, active_tid, LSN_FORMAT_ARGS(table->data.min_lsn),
+							LSN_FORMAT_ARGS(redo_lsn), LSN_FORMAT_ARGS(table->data.max_lsn),
+							LSN_FORMAT_ARGS((RecoveryInProgress() ? polar_get_xlog_replay_recptr_nolock() : GetFlushRecPtr(NULL)))),
+					 errhint("Rebuild the replica from a healthy primary or a valid backup before retrying promotion.")));
+
+		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+		log_index_close_cached_files();
+
+		/* The first retained table can be in the middle of a missing segment. */
+		LOG_INDEX_FILE_TABLE_NAME(path, LOG_INDEX_FILE_TABLE_SEGMENT_NO(first_tid));
+		fd = PathNameOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
+		if (fd < 0)
+			ereport(FATAL, (errcode_for_file_access(), errmsg("could not create file \"%s\": %m", path)));
+		FileClose(fd);
+		LWLockAcquire(bloom_lock, LW_EXCLUSIVE);
+		if (!SimpleLruDoesPhysicalPageExist(&logindex_snapshot->bloom_ctl, pageno))
+			SimpleLruZeroPage(&logindex_snapshot->bloom_ctl, pageno);
+		LWLockRelease(bloom_lock);
+
+		/*
+		 * Persist a real table before moving the metadata. In particular, do
+		 * not publish first_tid - 1 as a synthetic anchor: it may be a hole,
+		 * and a crash at that point would make the next startup read it.
+		 */
+		if (!log_index_write_table_data(logindex_snapshot, table, &seg_fd))
+			log_index_report_io_error(logindex_snapshot, first_tid);
+		log_index_close_seg_fd(&seg_fd);
+		SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
+		meta->max_idx_table_id = first_tid;
+		meta->max_lsn = table->data.max_lsn;
+		SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
+		min_seg->segment_no = LOG_INDEX_FILE_TABLE_SEGMENT_NO(first_tid);
+		min_seg->min_idx_table_id = first_tid;
+		min_seg->max_idx_table_id = first_tid;
+		min_seg->max_lsn = table->data.max_lsn;
+		log_index_write_meta(logindex_snapshot, meta, false);
+		LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+		LWLockRelease(LOG_INDEX_IO_LOCK);
+		LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+		repaired = true;
+		elog(LOG, "Repaired %s logindex publication at retained table %lu during promotion",
+			 logindex_snapshot->dir, first_tid);
+	}
+
+	/* Old FLUSHED marks above the adopted metadata no longer prove persistence. */
+	for (tid = Max(first_tid, meta->max_idx_table_id + 1); tid < active_tid; tid++)
+	{
+		log_index_mem_table table = LOG_INDEX_MEM_TBL((tid - 1) % logindex_snapshot->mem_tbl_size);
+
+		LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+		if (LOG_INDEX_MEM_TBL_TID(table) != tid ||
+			(LOG_INDEX_MEM_TBL_STATE(table) != LOG_INDEX_MEM_TBL_STATE_INACTIVE &&
+			 LOG_INDEX_MEM_TBL_STATE(table) != LOG_INDEX_MEM_TBL_STATE_FLUSHED))
+			ereport(FATAL,
+					(errmsg("cannot repair %s logindex numbering during promotion",
+							logindex_snapshot->dir),
+					 errdetail("Retained table %lu changed during promotion.", tid),
+					 errhint("Rebuild the replica from a healthy primary or a valid backup before retrying promotion.")));
+		if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_FLUSHED)
+		{
+			LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_INACTIVE);
+			repaired = true;
+		}
+		LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+	}
+	return repaired;
+}
+
 void
 polar_replica_promote_logindex(log_index_snapshot logindex_snapshot, bool missing_ok)
 {
@@ -2598,6 +2739,8 @@ polar_replica_promote_logindex(log_index_snapshot logindex_snapshot, bool missin
 	SlruShared	shared = logindex_snapshot->bloom_ctl.shared;
 	log_index_promoted_info_t *promoted_info = &logindex_snapshot->promoted_info;
 	log_idx_table_id_t max_saved_tid = LOG_INDEX_TABLE_INVALID_ID;
+	bool reset_meta = false;
+	bool repaired;
 
 	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
 
@@ -2614,14 +2757,39 @@ polar_replica_promote_logindex(log_index_snapshot logindex_snapshot, bool missin
 		elog(WARNING, "Failed to get logindex meta from storage");
 		polar_logindex_snapshot_remove_data(logindex_snapshot);
 		MemSet(meta, 0, sizeof(log_index_meta_t));
+		reset_meta = true;
 	}
 	else
 		elog(FATAL, "Failed to read logindex meta from shared storage");
 
 	logindex_snapshot->last_published_table_id = meta->max_idx_table_id;
 	shared->polar_replica_promoting = true;
+	if (reset_meta)
+	{
+		char path[MAXPGPATH];
+
+		/* Readers can still refresh metadata while the repair runs. */
+		snprintf(path, sizeof(path), "%s/%s", POLAR_DATA_DIR(), logindex_snapshot->dir);
+		polar_validate_dir(path);
+		log_index_close_cached_files();
+		log_index_write_meta(logindex_snapshot, meta, false);
+	}
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+
+	repaired = log_index_repair_promoted_tables(logindex_snapshot);
+	/* Readers recheck this state under the same lock before refreshing meta. */
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
 	pg_atomic_fetch_or_u32(&logindex_snapshot->state, POLAR_LOGINDEX_STATE_WRITABLE);
 	LWLockRelease(LOG_INDEX_IO_LOCK);
+
+	if (repaired)
+	{
+		log_idx_table_id_t active_tid = LOG_INDEX_MEM_TBL_TID(LOG_INDEX_MEM_TBL_ACTIVE());
+		log_index_mem_table last = LOG_INDEX_MEM_TBL((active_tid - 2) % logindex_snapshot->mem_tbl_size);
+
+		/* Finish the repair before acknowledging the promotion handshake. */
+		log_index_flush_table(logindex_snapshot, last->data.max_lsn, false);
+	}
 
 	/* Force to update logindex table which is inactive to be flushed */
 	log_index_update_replica_table_state(logindex_snapshot, max_saved_tid);

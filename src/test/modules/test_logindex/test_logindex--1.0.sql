@@ -63,3 +63,11 @@ LANGUAGE C STRICT;
 CREATE FUNCTION test_fullpage_inflight_occupied() RETURNS int
 AS 'MODULE_PATHNAME', 'test_fullpage_inflight_occupied'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION test_logindex_reset_meta()
+RETURNS bytea STRICT
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_logindex_promoted_storage()
+RETURNS int8 STRICT
+AS 'MODULE_PATHNAME' LANGUAGE C;

@@ -37,6 +37,7 @@
 #include "postmaster/postmaster.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
+#include "storage/fd.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
@@ -955,6 +956,9 @@ test_logindex_refresh_main(Datum main_arg)
 			polar_logindex_release_page_iterator(iter);
 			break;
 		}
+		case 4:
+			polar_replica_promote_logindex(logindex_snapshot, true);
+			break;
 		default:
 			elog(ERROR, "unexpected metadata refresh test mode %d", mode);
 	}
@@ -1287,6 +1291,89 @@ test_logindex_publication(void)
 	pfree(disk_table);
 }
 
+/* Verify that readers can refresh while a missing-meta promotion is paused. */
+static void
+test_logindex_missing_meta_promote(log_index_snapshot logindex_snapshot)
+{
+	BackgroundWorker worker = {0};
+	BackgroundWorkerHandle *handle;
+	BufferTag tag;
+	log_index_mem_table table;
+	log_index_meta_t disk_meta;
+	char path[MAXPGPATH];
+	pid_t pid;
+	int waits;
+	bool readable;
+
+	/* Start a new generation with one inactive table and one active table. */
+	snprintf(path, sizeof(path), "%s/%s/%s", POLAR_DATA_DIR(),
+			 logindex_snapshot->dir, LOG_INDEX_META_FILE);
+	durable_unlink(path, ERROR);
+	pg_atomic_write_u32(&logindex_snapshot->state, 0);
+	polar_logindex_snapshot_init(logindex_snapshot, LSN_TEST_STEP, 1, false, false);
+	polar_logindex_set_start_lsn(logindex_snapshot, LSN_TEST_STEP);
+	MemSet(&tag, 0, sizeof(tag));
+	tag.spcOid = 30;
+	tag.dbOid = 31;
+	tag.relNumber = 32;
+	tag.forkNum = MAIN_FORKNUM;
+	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+						  ((XLogRecPtr) 1 << 32) + LSN_TEST_STEP);
+	tag.blockNum++;
+	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+						  ((XLogRecPtr) 2 << 32) + LSN_TEST_STEP);
+
+	table = LOG_INDEX_MEM_TBL(0);
+	LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+	durable_unlink(path, ERROR);
+	pg_atomic_fetch_and_u32(&logindex_snapshot->state, ~POLAR_LOGINDEX_STATE_WRITABLE);
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+	pg_atomic_write_u32(refresh_worker_done, 0);
+
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	strlcpy(worker.bgw_library_name, "test_logindex", BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, "test_logindex_refresh_main", BGW_MAXLEN);
+	strlcpy(worker.bgw_name, "test_logindex_missing_meta", BGW_MAXLEN);
+	strlcpy(worker.bgw_type, "test_logindex_missing_meta", BGW_MAXLEN);
+	worker.bgw_main_arg = Int32GetDatum(4);
+	worker.bgw_notify_pid = MyProcPid;
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle) ||
+		WaitForBackgroundWorkerStartup(handle, &pid) != BGWH_STARTED)
+		elog(ERROR, "could not start missing-meta promotion worker");
+
+	/* Repair's ring scan follows the first I/O-lock release, before WRITABLE. */
+	for (waits = 0; pg_atomic_read_u32(&LOG_INDEX_MEM_TBL_LOCK(table)->nwaiters) == 0; waits++)
+	{
+		if (waits >= 10000)
+			elog(ERROR, "promotion worker did not reach the retained table lock");
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+	}
+	Assert(!polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE));
+	Assert(logindex_snapshot->bloom_ctl.shared->polar_replica_promoting);
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_SHARED);
+	readable = log_index_get_meta(logindex_snapshot, &disk_meta);
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+	if (readable)
+	{
+		Assert(disk_meta.max_idx_table_id == LOG_INDEX_TABLE_INVALID_ID);
+		/* Exercise the same refresh that startup's force-save would use. */
+		log_index_force_save_table(logindex_snapshot, table);
+	}
+	LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+	if (WaitForBackgroundWorkerShutdown(handle) != BGWH_STOPPED ||
+		pg_atomic_read_u32(refresh_worker_done) != 1)
+		elog(ERROR, "missing-meta promotion worker did not finish");
+	if (!readable)
+		elog(ERROR, "promotion exposed missing metadata to a read-only refresh");
+
+	Assert(polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE));
+	Assert(test_published_tid(logindex_snapshot) == LOG_INDEX_TABLE_INVALID_ID);
+}
+
 PG_FUNCTION_INFO_V1(test_logindex);
 /*
  * SQL-callable entry point to perform all tests.
@@ -1356,6 +1443,7 @@ test_logindex(PG_FUNCTION_ARGS)
 	Assert(WaitForBackgroundWorkerShutdown(bgwriter_handle) == BGWH_STOPPED);
 
 	test_logindex_publication();
+	test_logindex_missing_meta_promote(test_publication_snapshot);
 
 	MemoryContextReset(polar_logindex_memory_context());
 
@@ -1411,4 +1499,86 @@ test_get_polar_parallel_replay_mode(PG_FUNCTION_ARGS)
 			 polar_parallel_replay_mode.standby_status);
 
 	PG_RETURN_TEXT_P(cstring_to_text(res));
+}
+
+/*
+ * Model a storage owner's logindex reset while a replica retains its memory
+ * table numbering. The TAP test stops the owner before calling this helper.
+ */
+PG_FUNCTION_INFO_V1(test_logindex_reset_meta);
+Datum
+test_logindex_reset_meta(PG_FUNCTION_ARGS)
+{
+	log_index_snapshot logindex_snapshot = polar_logindex_redo_instance->wal_logindex_snapshot;
+	log_index_meta_t empty_meta;
+	log_idx_table_id_t active_tid;
+	bytea *result;
+
+	if (!superuser() || !polar_is_replica() ||
+		polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE))
+		elog(ERROR, "test_logindex_reset_meta requires a read-only replica and superuser");
+
+	SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
+	active_tid = LOG_INDEX_MEM_TBL_TID(LOG_INDEX_MEM_TBL_ACTIVE());
+	SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
+	if (active_tid <= logindex_snapshot->mem_tbl_size + 1)
+		elog(ERROR, "test requires the memory table ring to have wrapped");
+
+	MemSet(&empty_meta, 0, sizeof(empty_meta));
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_SHARED);
+	empty_meta.start_lsn = logindex_snapshot->meta.start_lsn;
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+	empty_meta.magic = LOG_INDEX_MAGIC;
+	empty_meta.version = LOG_INDEX_VERSION;
+	empty_meta.crc = log_index_calc_crc((unsigned char *) &empty_meta, sizeof(empty_meta));
+	result = palloc(VARHDRSZ + sizeof(empty_meta));
+	SET_VARSIZE(result, VARHDRSZ + sizeof(empty_meta));
+	memcpy(VARDATA(result), &empty_meta, sizeof(empty_meta));
+	PG_RETURN_BYTEA_P(result);
+}
+
+/* Force both table and bloom reads from disk after promotion repair. */
+PG_FUNCTION_INFO_V1(test_logindex_promoted_storage);
+Datum
+test_logindex_promoted_storage(PG_FUNCTION_ARGS)
+{
+	log_index_snapshot logindex_snapshot = polar_logindex_redo_instance->wal_logindex_snapshot;
+	log_index_meta_t meta;
+	log_idx_table_id_t tid;
+	log_index_table_t *disk_table = palloc(sizeof(log_index_table_t));
+
+	if (!superuser() || RecoveryInProgress())
+		elog(ERROR, "test_logindex_promoted_storage requires a promoted primary and superuser");
+	LOG_INDEX_COPY_META(&meta);
+	if (meta.min_segment_info.min_idx_table_id <= 1)
+		elog(ERROR, "test requires a repaired logindex prefix");
+
+	for (tid = meta.min_segment_info.min_idx_table_id; tid <= meta.max_idx_table_id; tid++)
+	{
+		log_index_mem_table table = LOG_INDEX_MEM_TBL((tid - 1) % logindex_snapshot->mem_tbl_size);
+		log_index_mem_table cached_table;
+		log_index_table_t *data;
+		log_index_table_bloom_t *bloom;
+
+		/* Prevent the reader from satisfying this request from the ring. */
+		LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_SHARED);
+		if (!log_index_read_table_data(logindex_snapshot, disk_table, tid, ERROR))
+			elog(ERROR, "could not read repaired logindex table");
+		data = log_index_read_table(logindex_snapshot, tid, &cached_table);
+		if (cached_table != NULL || data->idx_table_id != tid ||
+			memcmp(data, disk_table, sizeof(*data)) != 0)
+			elog(ERROR, "repaired logindex segment read differs from table read");
+		LWLockRelease(LOG_INDEX_IO_LOCK);
+		LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+
+		polar_logindex_invalid_bloom_cache(logindex_snapshot, tid, false);
+		bloom = log_index_get_tbl_bloom(logindex_snapshot, tid);
+		if (bloom->idx_table_id != tid)
+			elog(ERROR, "repaired logindex bloom has wrong table id");
+		LWLockRelease(SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl,
+										 LOG_INDEX_TBL_BLOOM_PAGE_NO(tid)));
+	}
+	pfree(disk_table);
+	PG_RETURN_INT64(meta.max_idx_table_id - meta.min_segment_info.min_idx_table_id + 1);
 }
