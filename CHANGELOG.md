@@ -228,6 +228,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed non-working log rotation via pg_ctl logrotate (XCOM-87)
 
 ### Performance
+
+- Speed up both readers of the XLOG queue, the walsender that streams
+  WAL meta to shared-storage replicas and the logindex saver on the
+  primary, by decoding each packet header once per record instead of
+  four times on the walsender's path and seven on the saver's
+  (XCOM-XXX)
+
 - Stop serialising every WAL reservation on the insert-position spinlock:
   replace the spinlock-protected reservation update with a packed 128-bit
   counter advanced by a single compare-and-swap (XCOM-XXX)
