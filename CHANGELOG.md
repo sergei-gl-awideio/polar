@@ -229,6 +229,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Performance
 
+- Speed up WAL streaming to a shared-storage replica that has fallen
+  behind: a walsender now fills each message with up to 128kB of xlog
+  meta instead of the 1kB it defaulted to, so a backlog is sent in a
+  fraction of the messages, each paying one sendmsg, one socket lock and
+  one queue reference rather than one per kilobyte (XCOM-XXX)
+
+
 - Speed up both readers of the XLOG queue, the walsender that streams
   WAL meta to shared-storage replicas and the logindex saver on the
   primary, by decoding each packet header once per record instead of
