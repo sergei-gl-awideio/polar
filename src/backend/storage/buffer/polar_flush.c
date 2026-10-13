@@ -307,7 +307,7 @@ polar_flush_list_ctl_shmem_size(void)
 		return size;
 
 	/* Size of the shared flush list control block */
-	size = add_size(size, MAXALIGN(sizeof(FlushControl)) * POLAR_FLUSHLIST_PARTITIONS);
+	size = add_size(size, MAXALIGN(sizeof(FlushControl)));
 
 	return size;
 }
