@@ -499,7 +499,22 @@ extern void log_index_insert_lsn(log_index_snapshot logindex_snapshot, log_index
 extern XLogRecPtr log_index_item_max_lsn(log_index_table_t *table, log_item_head_t *item);
 extern pg_crc32 log_index_calc_crc(unsigned char *data, size_t size);
 
-extern bool log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table table);
+/*
+ * A segment descriptor keyed by snapshot and segment number; fd < 0 is empty.
+ * Writers append to the newest segment, which truncation does not remove.
+ * Recycled segments get a new number and are reopened by path.
+ */
+typedef struct log_index_seg_fd_t
+{
+	log_index_snapshot owner;
+	uint64		segno;
+	File		fd;
+} log_index_seg_fd_t;
+
+#define LOG_INDEX_SEG_FD_EMPTY { NULL, 0, -1 }
+
+extern bool log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table table,
+								  log_index_seg_fd_t *seg_fd);
 extern log_index_table_t *log_index_read_table(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid, log_index_mem_table *mem_table);
 extern log_index_table_bloom_t *log_index_get_tbl_bloom(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid);
 extern bool log_index_get_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *meta);

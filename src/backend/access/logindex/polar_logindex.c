@@ -55,6 +55,10 @@ static int	logindex_errno = 0;
 
 static void log_index_insert_new_item(log_index_lsn_info lsn_info, log_index_mem_table table, uint32 key, log_seg_id_t new_item_id);
 static void log_index_insert_new_seg(log_index_mem_table table, log_seg_id_t head, log_seg_id_t seg_id, log_index_lsn_info lsn_info);
+static void log_index_write_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *meta, bool update);
+static void log_index_close_meta_file(void);
+static void log_index_close_seg_fd(log_index_seg_fd_t *seg_fd);
+static void log_index_close_cached_files(void);
 
 bool
 polar_logindex_check_state(log_index_snapshot logindex_snapshot, uint32 state)
@@ -194,6 +198,9 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 	bool		write_done = false;
 	static XLogRecPtr last_flush_max_lsn = InvalidXLogRecPtr;
 
+	/* Reuse the newest segment's descriptor for this flush round. */
+	log_index_seg_fd_t seg_fd = LOG_INDEX_SEG_FD_EMPTY;
+
 	SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
 	mid = meta->max_idx_table_id % logindex_snapshot->mem_tbl_size;
 	SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
@@ -247,7 +254,7 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 					succeed = true;
 				}
 				else
-					succeed = log_index_write_table(logindex_snapshot, table);
+					succeed = log_index_write_table(logindex_snapshot, table, &seg_fd);
 
 				if (succeed)
 				{
@@ -303,6 +310,8 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 		mid %= logindex_snapshot->mem_tbl_size;
 	}
 	while (need_flush);
+
+	log_index_close_seg_fd(&seg_fd);
 
 	return write_done;
 }
@@ -487,6 +496,9 @@ polar_logindex_snapshot_remove_data(log_index_snapshot logindex_snapshot)
 
 	if (strlen(logindex_snapshot->dir) > 0)
 	{
+		/* Writers must be stopped before removing their snapshot's files. */
+		log_index_close_cached_files();
+
 		POLAR_FILE_PATH(path, logindex_snapshot->dir);
 		rmtree(path, false);
 	}
@@ -777,12 +789,73 @@ polar_logindex_start_lsn(log_index_snapshot logindex_snapshot)
 	return start_lsn;
 }
 
+/* Cache one metadata descriptor per process, reopening on snapshot changes. */
+typedef struct log_index_meta_fd_t
+{
+	char		path[MAXPGPATH];
+	File		fd;
+} log_index_meta_fd_t;
+
+#define LOG_INDEX_META_FD_EMPTY { "", -1 }
+
+static log_index_meta_fd_t meta_fd = LOG_INDEX_META_FD_EMPTY;
+
+/*
+ * Forced saves move forward, so their cached segment is newer than any segment
+ * eligible for truncation.  Snapshot removal closes this descriptor before
+ * restarting segment numbering.
+ */
+static log_index_seg_fd_t force_seg_fd = LOG_INDEX_SEG_FD_EMPTY;
+
+static void
+log_index_close_meta_file(void)
+{
+	if (meta_fd.fd >= 0)
+	{
+		FileClose(meta_fd.fd);
+		meta_fd.fd = -1;
+		meta_fd.path[0] = '\0';
+	}
+}
+
+/* Close descriptors retained across calls in this process. */
+static void
+log_index_close_cached_files(void)
+{
+	log_index_close_meta_file();
+	log_index_close_seg_fd(&force_seg_fd);
+}
+
+static File
+log_index_get_meta_file(const char *path, bool create)
+{
+	int			flag = O_RDWR | PG_BINARY;
+
+	if (meta_fd.fd >= 0)
+	{
+		if (strcmp(meta_fd.path, path) == 0)
+			return meta_fd.fd;
+
+		/* A different snapshot's meta file */
+		log_index_close_meta_file();
+	}
+
+	if (create)
+		flag |= O_CREAT;
+
+	meta_fd.fd = PathNameOpenFile(path, flag);
+
+	if (meta_fd.fd >= 0)
+		strlcpy(meta_fd.path, path, MAXPGPATH);
+
+	return meta_fd.fd;
+}
+
 static void
 log_index_write_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *meta, bool update)
 {
 	File		fd;
 	char		meta_path[MAXPGPATH];
-	int			flag = O_RDWR | PG_BINARY;
 	int			save_errno;
 
 	snprintf(meta_path, MAXPGPATH, "%s/%s/%s", POLAR_DATA_DIR(), logindex_snapshot->dir, LOG_INDEX_META_FILE);
@@ -795,10 +868,7 @@ log_index_write_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *met
 	meta->crc = 0;
 	meta->crc = log_index_calc_crc((unsigned char *) meta, sizeof(log_index_meta_t));
 
-	if (!update)
-		flag |= O_CREAT;
-
-	if ((fd = PathNameOpenFile(meta_path, flag)) == -1)
+	if ((fd = log_index_get_meta_file(meta_path, !update)) < 0)
 	{
 		save_errno = errno;
 		POLAR_LOG_LOGINDEX_META_INFO(meta);
@@ -824,7 +894,7 @@ log_index_write_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *met
 		ereport(PANIC, (errmsg("could not flush file \"%s\": \"%s\"", meta_path, strerror(save_errno))));
 	}
 
-	FileClose(fd);
+	/* fd stays open, see log_index_get_meta_file() */
 }
 
 /*
@@ -875,8 +945,8 @@ log_index_force_save_table(log_index_snapshot logindex_snapshot, log_index_mem_t
 				succeed = true;
 				LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
 			}
-			else if (log_index_write_table(logindex_snapshot, table))
-				succeed = true;
+			else
+				succeed = log_index_write_table(logindex_snapshot, table, &force_seg_fd);
 
 			if (!succeed)
 			{
@@ -1375,8 +1445,50 @@ log_index_read_table_data(log_index_snapshot logindex_snapshot, log_index_table_
 	return true;
 }
 
+/*
+ * Return a descriptor for the segment file holding tid, reusing the cached one
+ * when it is the same segment of the same logindex.  The cache is not optional:
+ * every writer holds one, and it is what closes the descriptor.
+ */
+static File
+log_index_get_table_file(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid,
+						 log_index_seg_fd_t *seg_fd, int elevel)
+{
+	uint64		segno = LOG_INDEX_FILE_TABLE_SEGMENT_NO(tid);
+	File		fd;
+
+	if (seg_fd->fd >= 0 && seg_fd->owner == logindex_snapshot &&
+		seg_fd->segno == segno)
+		return seg_fd->fd;
+
+	/* Moved on to the next segment file, or to the other logindex */
+	log_index_close_seg_fd(seg_fd);
+
+	fd = log_index_open_table_file(logindex_snapshot, tid, false, elevel);
+
+	if (fd >= 0)
+	{
+		seg_fd->owner = logindex_snapshot;
+		seg_fd->segno = segno;
+		seg_fd->fd = fd;
+	}
+
+	return fd;
+}
+
+static void
+log_index_close_seg_fd(log_index_seg_fd_t *seg_fd)
+{
+	if (seg_fd->fd >= 0)
+	{
+		FileClose(seg_fd->fd);
+		seg_fd->fd = -1;
+	}
+}
+
 static bool
-log_index_write_table_data(log_index_snapshot logindex_snapshot, log_index_mem_table table)
+log_index_write_table_data(log_index_snapshot logindex_snapshot, log_index_mem_table table,
+						   log_index_seg_fd_t *seg_fd)
 {
 	bool		ret = false;
 	File		fd;
@@ -1384,7 +1496,7 @@ log_index_write_table_data(log_index_snapshot logindex_snapshot, log_index_mem_t
 	log_idx_table_id_t tid = table->data.idx_table_id;
 	log_index_table_t *table_data = NULL;
 
-	fd = log_index_open_table_file(logindex_snapshot, tid, false, polar_trace_logindex(DEBUG4));
+	fd = log_index_get_table_file(logindex_snapshot, tid, seg_fd, polar_trace_logindex(DEBUG4));
 
 	if (fd < 0)
 		return ret;
@@ -1416,8 +1528,6 @@ log_index_write_table_data(log_index_snapshot logindex_snapshot, log_index_mem_t
 	log_index_save_bloom(logindex_snapshot, tid, bloom);
 	ret = log_index_save_table(logindex_snapshot, table_data, fd, bloom);
 	pfree(bloom);
-
-	FileClose(fd);
 
 	/* must pfree temporary active table memory */
 	if (table_data != &table->data)
@@ -1658,7 +1768,8 @@ log_index_read_table(log_index_snapshot logindex_snapshot, log_idx_table_id_t ti
 }
 
 bool
-log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table table)
+log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table table,
+					  log_index_seg_fd_t *seg_fd)
 {
 	bool		succeed = false;
 	uint64		segment_no;
@@ -1685,7 +1796,7 @@ log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table 
 	{
 		bool		active_state_before_write = (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_ACTIVE);
 
-		if (!log_index_write_table_data(logindex_snapshot, table))
+		if (!log_index_write_table_data(logindex_snapshot, table, seg_fd))
 			log_index_report_io_error(logindex_snapshot, LOG_INDEX_MEM_TBL_TID(table));
 
 		/*

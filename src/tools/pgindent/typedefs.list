@@ -3651,6 +3651,8 @@ locale_t
 locate_agg_of_level_context
 locate_var_of_level_context
 locate_windowfunc_context
+log_index_meta_fd_t
+log_index_seg_fd_t
 logstreamer_param
 log_index_file_segment_t
 log_index_io_err_t
