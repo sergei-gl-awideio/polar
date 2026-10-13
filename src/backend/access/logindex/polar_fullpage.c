@@ -180,6 +180,16 @@ polar_logindex_calc_max_fullpage_no(polar_fullpage_ctl_t ctl)
 	/* wal file has been removed olready, we cannot get fullpage_no by lsn */
 	if (polar_lstat(path, &statbuf) < 0)
 	{
+		/*
+		 * Resetting to zero is destructive rather than conservative: the next
+		 * future page write re-issues fullpage_no 0 and starts overwriting
+		 * the fullpage space from the bottom.  Name the file we did not find,
+		 * so a reset because the wal really is gone can be told apart from
+		 * one because the path was built wrong.  The timeline is the first
+		 * field of that name.
+		 */
+		elog(LOG, "fullpage_no reset to 0: no wal file \"%s\" for logindex max lsn %X/%X",
+			 path, LSN_FORMAT_ARGS(lsn));
 		pg_atomic_write_u64(&ctl->max_fullpage_no, 0);
 		return;
 	}

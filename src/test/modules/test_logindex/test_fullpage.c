@@ -224,3 +224,36 @@ test_fullpage(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(0);
 }
+
+PG_FUNCTION_INFO_V1(test_fullpage_roll_table);
+/*
+ * Retire the fullpage logindex's active table and put it on storage.
+ *
+ * The meta file only learns a max lsn from a table that has gone inactive:
+ * log_index_write_table() skips the meta update for an active one.  Until that
+ * happens a restart brings the snapshot back with no max lsn at all, and
+ * polar_logindex_calc_max_fullpage_no() returns before it looks up any wal
+ * file.  Rolling the table here is what lets a restart reach the code under
+ * test without first writing the thousands of snapshots it would take to fill
+ * the table honestly.
+ */
+Datum
+test_fullpage_roll_table(PG_FUNCTION_ARGS)
+{
+	log_index_snapshot logindex_snapshot =
+		polar_logindex_redo_instance->fullpage_logindex_snapshot;
+	log_index_mem_table active;
+	LWLock	   *lock;
+
+	Assert(logindex_snapshot != NULL);
+
+	active = LOG_INDEX_MEM_TBL_ACTIVE();
+	lock = LOG_INDEX_MEM_TBL_LOCK(active);
+
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	LOG_INDEX_MEM_TBL_SET_STATE(active, LOG_INDEX_MEM_TBL_STATE_INACTIVE);
+	log_index_force_save_table(logindex_snapshot, active);
+	LWLockRelease(lock);
+
+	PG_RETURN_INT64(LOG_INDEX_MEM_TBL_TID(active));
+}
