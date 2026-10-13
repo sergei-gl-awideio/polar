@@ -274,7 +274,12 @@ extern struct config_generic *polar_parameter_check_name_internal(const char *gu
 /* POLAR end */
 
 /* POLAR defines start */
-#define MAX_NUM_OF_PARALLEL_BGWRITER	64
+/*
+ * Keep the worker ceiling in step with POLAR_FLUSHLIST_PARTITIONS.  Each
+ * flush-list task owns a partition while flushing it.  The configured worker
+ * count is capped at half this value to leave room for dynamic scaling.
+ */
+#define MAX_NUM_OF_PARALLEL_BGWRITER	256
 /* POLAR defines end */
 
 /* GUC vars that are actually defined in guc_tables.c, rather than elsewhere */

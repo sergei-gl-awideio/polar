@@ -170,7 +170,7 @@ polar_cal_cur_consistent_lsn(void)
 	 * LSN below the value we are about to return.
 	 *
 	 * polar_cal_cur_consistent_lsn runs infrequently (flush coordinator
-	 * only), so the cost of taking all 64 spinlocks is negligible.  All other
+	 * only), and takes all partition locks for this scan.  All other
 	 * sites hold at most one partition spinlock at a time, so no deadlock is
 	 * possible.
 	 */

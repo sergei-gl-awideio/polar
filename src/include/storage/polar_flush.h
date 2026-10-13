@@ -50,7 +50,7 @@
 #define POLAR_FLUSHNEXT_END_OF_LIST	(-1)
 #define POLAR_FLUSHNEXT_NOT_IN_LIST	(-2)
 
-#define POLAR_FLUSHLIST_PARTITIONS (64)
+#define POLAR_FLUSHLIST_PARTITIONS (256)
 
 typedef struct polar_sync_buffer_io
 {
