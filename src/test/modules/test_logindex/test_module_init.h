@@ -28,11 +28,13 @@ extern Size test_logindex_request_shmem_size(void);
 extern Size test_mini_trans_request_shmem_size(void);
 extern Size test_rel_size_cache_request_shmem_size(void);
 extern Size test_ringbuf_request_shmem_size(void);
+extern Size test_fullpage_sweep_request_shmem_size(void);
 
 extern void test_logindex_shmem_startup(void);
 extern void test_mini_trans_shmem_startup(void);
 extern void test_rel_size_cache_shmem_startup(void);
 extern void test_ringbuf_shmem_startup(void);
+extern void test_fullpage_sweep_shmem_startup(void);
 
 extern void _PG_init(void);
 

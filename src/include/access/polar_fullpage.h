@@ -56,11 +56,45 @@ typedef struct polar_fullpage_ctl_data_t
 	LWLockPadded file_lock;
 	char		name[MAX_FULLPAGE_DIR_NAME_LEN];
 	pg_atomic_uint64 max_fullpage_no;
+
+	/*
+	 * Largest distance ever seen between a reserved fullpage_no and
+	 * max_fullpage_no at the moment that reservation's record reached WAL.
+	 * This bounds how far fullpage_no can be inverted against lsn for the
+	 * reservations that already reached WAL, and is what
+	 * remove_old_fullpage_files() sweeps by.
+	 */
+	pg_atomic_uint64 max_fullpage_no_gap;
+
+	/*
+	 * max_fullpage_no_gap only describes the records this instance inserted,
+	 * so remove_old_fullpage_files() must not sweep until the logindex min
+	 * lsn has reached this point.
+	 */
+	pg_atomic_uint64 sweep_safe_lsn;
+
 	log_index_snapshot logindex_snapshot;
 	polar_ringbuf_t queue;
 	pg_atomic_uint32 procno;
 	polar_fullpage_stat_t stat;
+
+	/*
+	 * A fullpage_no is reserved long before its WAL record exists, and
+	 * max_fullpage_no_gap says nothing about a reservation that has not
+	 * reached WAL yet - the counter keeps advancing while that writer is
+	 * stalled, so the sweep floor can climb over it.  Each process therefore
+	 * publishes the reservation it is working on here, indexed by pgprocno,
+	 * and remove_old_fullpage_files() floors its sweep by the oldest one
+	 * still in flight.  An idle slot holds POLAR_FULLPAGE_NO_INFLIGHT.
+	 *
+	 * Must stay last: sized by polar_fullpage_shmem_size().
+	 */
+	int			num_inflight_slots;
+	pg_atomic_uint64 inflight_fullpage_no[FLEXIBLE_ARRAY_MEMBER];
 } polar_fullpage_ctl_data_t;
+
+/* An in-flight slot holding no reservation */
+#define POLAR_FULLPAGE_NO_INFLIGHT	PG_UINT64_MAX
 
 typedef polar_fullpage_ctl_data_t *polar_fullpage_ctl_t;
 

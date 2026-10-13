@@ -30,6 +30,7 @@
 #include "access/polar_logindex_redo.h"
 #include "access/polar_fullpage.h"
 #include "access/polar_queue_manager.h"
+#include "access/twophase.h"	/* max_prepared_xacts, via POLAR_TOTALPROCS */
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
@@ -87,7 +88,20 @@ polar_fullpage_logindex_init_lwlock_array(log_index_snapshot logindex_snapshot)
 Size
 polar_fullpage_shmem_size(void)
 {
-	return CACHELINEALIGN(sizeof(polar_fullpage_ctl_data_t));
+	Size		size;
+
+	/*
+	 * One in-flight slot per PGPROC, indexed by pgprocno.  POLAR_TOTALPROCS
+	 * is the length of the array InitProcGlobal() numbers, so this covers
+	 * every pgprocno that can exist.  It is max_prepared_xacts slots longer
+	 * than it strictly needs to be, since the prepared xact PGPROCs at the
+	 * top are never a running process, but that is 8 bytes each against not
+	 * having to argue about which procs reach polar_log_fullpage_begin().
+	 */
+	size = offsetof(polar_fullpage_ctl_data_t, inflight_fullpage_no);
+	size = add_size(size, mul_size(POLAR_TOTALPROCS, sizeof(pg_atomic_uint64)));
+
+	return CACHELINEALIGN(size);
 }
 
 polar_fullpage_ctl_t
@@ -105,10 +119,19 @@ polar_fullpage_shmem_init(const char *name, polar_ringbuf_t queue, log_index_sna
 
 	if (!IsUnderPostmaster)
 	{
+		int			i;
+
 		POLAR_ASSERT_PANIC(!found);
-		memset(ctl, 0, sizeof(polar_fullpage_ctl_data_t));
+		memset(ctl, 0, polar_fullpage_shmem_size());
 
 		pg_atomic_init_u64(&ctl->max_fullpage_no, 0);
+		pg_atomic_init_u64(&ctl->max_fullpage_no_gap, 0);
+		pg_atomic_init_u64(&ctl->sweep_safe_lsn, InvalidXLogRecPtr);
+
+		ctl->num_inflight_slots = POLAR_TOTALPROCS;
+
+		for (i = 0; i < ctl->num_inflight_slots; i++)
+			pg_atomic_init_u64(&ctl->inflight_fullpage_no[i], POLAR_FULLPAGE_NO_INFLIGHT);
 
 		/* Init fullpage lock */
 		LWLockInitialize(&ctl->file_lock.lock, LWTRANCHE_FULLPAGE_FILE);
@@ -475,21 +498,59 @@ fullpage_file_open(polar_fullpage_ctl_t ctl, uint64 fullpage_no)
 	return polar_fullpage_file_init(ctl, fullpage_no);
 }
 
+/*
+ * Drop whatever reservation this process was holding.  Registered as a shmem
+ * exit callback so that a proc_exit() that never unwinds through the
+ * PG_FINALLY in polar_log_fullpage_snapshot_image() - a FATAL, say - does not
+ * leave a slot pinning the sweep floor for the rest of the instance's life.
+ */
+static void
+polar_fullpage_inflight_shmem_exit(int code, Datum arg)
+{
+	polar_fullpage_ctl_t ctl = (polar_fullpage_ctl_t) DatumGetPointer(arg);
+
+	if (MyProc != NULL)
+		pg_atomic_write_u64(&ctl->inflight_fullpage_no[MyProcNumber],
+							POLAR_FULLPAGE_NO_INFLIGHT);
+}
+
+/*
+ * Publish a lower bound before reserving a number.  The fetch_add's full
+ * barrier orders this store before any later reservation can advance the
+ * sweep floor past us.  The slot remains occupied until both the WAL record
+ * and page image are written; remove_old_fullpage_files() also consults it.
+ */
 static uint64
 polar_log_fullpage_begin(polar_fullpage_ctl_t ctl)
 {
-	/*
-	 * fullpage_no must keep the same order with lsn.
-	 */
-	LWLockAcquire(LOG_INDEX_FULLPAGE_FILE_LOCK(ctl), LW_EXCLUSIVE);
+	static bool exit_callback_registered = false;
+
+	Assert(MyProc != NULL);
+	Assert(MyProcNumber < ctl->num_inflight_slots);
+
+	if (unlikely(!exit_callback_registered))
+	{
+		on_shmem_exit(polar_fullpage_inflight_shmem_exit, PointerGetDatum(ctl));
+		exit_callback_registered = true;
+	}
+
+	pg_atomic_write_u64(&ctl->inflight_fullpage_no[MyProcNumber],
+						pg_atomic_read_u64(&ctl->max_fullpage_no));
 
 	return pg_atomic_fetch_add_u64(&ctl->max_fullpage_no, 1);
 }
 
+/*
+ * Done with the reservation: the record is in WAL, its gap is recorded and the
+ * page image is written, so max_fullpage_no_gap covers it from here on.
+ */
 static void
 polar_log_fullpage_end(polar_fullpage_ctl_t ctl)
 {
-	LWLockRelease(LOG_INDEX_FULLPAGE_FILE_LOCK(ctl));
+	/* Publish the gap (or our observation of an existing bound) before idle. */
+	pg_memory_barrier();
+	pg_atomic_write_u64(&ctl->inflight_fullpage_no[MyProcNumber],
+						POLAR_FULLPAGE_NO_INFLIGHT);
 }
 
 /*
@@ -666,31 +727,127 @@ remove_old_fullpage_files(polar_fullpage_ctl_t ctl)
 	char		path[MAXPGPATH] = {0};
 	uint64		min_fullpage_seg_no = 0;
 	uint64		fullpage_no = 0;
+	uint64		min_fullpage_no = 0;
+	uint64		min_inflight_no = POLAR_FULLPAGE_NO_INFLIGHT;
+	uint64		margin = 0;
+	int			i;
 	struct stat statbuf;
 	XLogSegNo	xlog_seg_no = 0;
 	XLogRecPtr	min_lsn = InvalidXLogRecPtr;
-	TimeLineID	tli;
+	XLogRecPtr	sweep_safe_lsn = InvalidXLogRecPtr;
 
 	if (polar_is_replica())
 		return;
 
+	/*
+	 * POLAR: the barrier below has to sit above everything an earlier
+	 * instance made durable, so it can only be armed once recovery has ended.
+	 * While recovery is in progress - primary crash recovery, or the tail of
+	 * an online promote - the replay position is still below the previous
+	 * instance's last record, and a barrier armed there would let that range
+	 * be swept using only our own measurements.  Nothing requests a
+	 * checkpoint that early today; this makes it structural rather than
+	 * incidental.
+	 */
 	if (RecoveryInProgress())
-		GetXLogReplayRecPtr(&tli);
-	else
-		tli = GetWALInsertionTimeLine();
+		return;
 
 	min_lsn = polar_get_logindex_snapshot_storage_min_lsn(ctl->logindex_snapshot);
 
+	/*
+	 * POLAR: the margin below is derived from max_fullpage_no_gap, which only
+	 * describes the records this instance inserted; whatever an earlier
+	 * instance left behind could be inverted by more than it says.  Rather
+	 * than making the gap durable, arm a barrier at the first sweep and
+	 * refuse to remove anything until min_lsn has passed it - by then every
+	 * record still in scope is one of ours.  This costs some retained
+	 * fullpage files after every restart and promotion, and nothing in steady
+	 * state.
+	 */
+	sweep_safe_lsn = pg_atomic_read_u64(&ctl->sweep_safe_lsn);
+
+	if (XLogRecPtrIsInvalid(sweep_safe_lsn))
+	{
+		/*
+		 * GetXLogInsertRecPtr() names the reserve frontier, not a record
+		 * boundary, so this can sit a little above the last record actually
+		 * inserted.  That is the safe direction: it only holds the first
+		 * sweep back until min_lsn passes a slightly higher point.
+		 */
+		sweep_safe_lsn = GetXLogInsertRecPtr();
+		pg_atomic_write_u64(&ctl->sweep_safe_lsn, sweep_safe_lsn);
+		elog(LOG, "fullpage files will be swept once the logindex min lsn reaches %X/%X",
+			 LSN_FORMAT_ARGS(sweep_safe_lsn));
+		return;
+	}
+
+	if (min_lsn < sweep_safe_lsn)
+		return;
+
 	/* check wal file is exist or not */
 	XLByteToSeg(min_lsn, xlog_seg_no, wal_segment_size);
-	XLogFilePath(path, tli, xlog_seg_no, wal_segment_size);
+	XLogFilePath(path, GetWALInsertionTimeLine(), xlog_seg_no, wal_segment_size);
 
 	/* wal file has been removed already, we cannot get fullpage_no by lsn */
 	if (polar_lstat(path, &statbuf) < 0)
 		return;
 
 	fullpage_no = polar_xlog_read_fullpage_no(ctl->logindex_snapshot, min_lsn);
-	min_fullpage_seg_no = FULLPAGE_FILE_SEG_NO(fullpage_no);
+
+	/*
+	 * POLAR: fullpage_no is reserved without holding a lock across XLogInsert
+	 * (see polar_log_fullpage_begin), so the record at min_lsn does not carry
+	 * the smallest fullpage_no still in use - a record with a higher lsn can
+	 * carry a lower one.  Two things bound that inversion by measurement
+	 * rather than by assumption, and the sweep floors by both.
+	 *
+	 * max_fullpage_no_gap covers the reservations that reached WAL.  It says
+	 * nothing about one still in flight: the counter keeps advancing past a
+	 * writer stalled between its fetch_add and its insert, and a whole
+	 * segment of that is only a couple of seconds of a busy future-page
+	 * workload, so without the second bound the floor could climb over a
+	 * segment that is about to be written.  The reservation would then land
+	 * on an unlinked inode through the writer's cached fd, and a replica
+	 * would later read that slot back out of a freshly zero-filled file.  So
+	 * also floor by the oldest reservation still in flight, which every
+	 * writer publishes before it takes its number.
+	 *
+	 * The three reads have to happen in this order.  Take any reservation N
+	 * below fullpage_no that must survive.  N came off the counter before the
+	 * record at min_lsn took its own number, which happened before that
+	 * record became durable, so N was published before we read fullpage_no
+	 * above.  If its writer is still in flight when we scan the slots we see
+	 * it there; if it finished first, it recorded its gap before we scan, and
+	 * therefore before we read max_fullpage_no_gap.  Reading the gap first
+	 * would leave a window in which a writer that finishes in between is
+	 * covered by neither.
+	 *
+	 * Keep at least one whole segment as a conservative minimum margin.
+	 *
+	 * Note that polar_fullpage_keep_segments gives no protection here: a
+	 * recycled segment is refilled with new fullpage_no values, so removal
+	 * and recycling both destroy the old snapshots.  This floor is the only
+	 * thing keeping an inverted-but-still-needed snapshot alive.
+	 */
+	pg_memory_barrier();
+
+	for (i = 0; i < ctl->num_inflight_slots; i++)
+	{
+		uint64		inflight_no = pg_atomic_read_u64(&ctl->inflight_fullpage_no[i]);
+
+		if (inflight_no < min_inflight_no)
+			min_inflight_no = inflight_no;
+	}
+
+	pg_memory_barrier();
+
+	margin = Max(FULLPAGE_NUM_PER_FILE, pg_atomic_read_u64(&ctl->max_fullpage_no_gap));
+
+	if (fullpage_no <= margin)
+		return;
+
+	min_fullpage_no = Min(fullpage_no - margin, min_inflight_no);
+	min_fullpage_seg_no = FULLPAGE_FILE_SEG_NO(min_fullpage_no);
 
 	while (min_fullpage_seg_no > 0)
 	{
@@ -724,6 +881,7 @@ polar_log_fullpage_snapshot_image(polar_fullpage_ctl_t ctl, Buffer buffer, XLogR
 	XLogRecPtr	recptr;
 	BufferDesc *buf_hdr = GetBufferDescriptor(buffer - 1);
 	uint64		fullpage_no = 0;
+	uint64		gap;
 	static char *fullpage = NULL;
 	PolarWalType wtype = PWT_FPSI;
 
@@ -768,27 +926,56 @@ polar_log_fullpage_snapshot_image(polar_fullpage_ctl_t ctl, Buffer buffer, XLogR
 	}
 
 	/*
-	 * POLAR: get fullpage write lock, only one process can write fullpage wal
-	 * record at the same time, we expected that fullpage_no keep the same
-	 * order with lsn, it's used for easily cleaning fullpage file NOTE: we
-	 * assume that XLogInsert is more faster than smgrread and
-	 * polar_write_fullpage
+	 * POLAR: reserve a fullpage_no.  This is not serialized against the
+	 * XLogInsert below, so fullpage_no is only approximately ordered with
+	 * lsn; see polar_log_fullpage_begin() and remove_old_fullpage_files().
 	 */
 	fullpage_no = polar_log_fullpage_begin(ctl);
 
-	XLogBeginInsert();
-	XLogRegisterBuffer(0, buffer, flags);
-	XLogRegisterData((char *) (&wtype), sizeof(PolarWalType));
-	XLogRegisterData((char *) (&fullpage_no), sizeof(uint64));
+	PG_TRY();
+	{
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buffer, flags);
+		XLogRegisterData((char *) (&wtype), sizeof(PolarWalType));
+		XLogRegisterData((char *) (&fullpage_no), sizeof(uint64));
 
-	recptr = XLogInsert(RM_XLOG_ID, POLAR_WAL);
-	pg_atomic_write_u64(&ctl->stat.insert_fullpage_lsn, recptr);
+		recptr = XLogInsert(RM_XLOG_ID, POLAR_WAL);
+		pg_atomic_write_u64(&ctl->stat.insert_fullpage_lsn, recptr);
 
-	/* POLAR: release fullpage write lock */
-	polar_log_fullpage_end(ctl);
+		/*
+		 * POLAR: record how far the counter ran ahead of us while we were
+		 * inserting.  This is the bound remove_old_fullpage_files() sweeps by
+		 * for reservations that are no longer in flight.
+		 *
+		 * Suppose a record s ends up with a lower fullpage_no than a record r
+		 * that has a lower lsn - the inversion the sweep has to survive.  s
+		 * reserved before r did, and r reserved before it took its WAL space,
+		 * which it did before s took its own.  So by the time s reaches this
+		 * line the counter is already past r's fullpage_no, and this gap is
+		 * at least the distance between them.  The largest gap ever recorded
+		 * therefore covers every inversion, with no assumption about how long
+		 * a writer can stall.
+		 *
+		 * Record the gap before releasing the reservation below, so that the
+		 * sweep never sees a fullpage_no neither protects: it scans the
+		 * in-flight slots before it reads max_fullpage_no_gap.
+		 */
+		gap = pg_atomic_read_u64(&ctl->max_fullpage_no) - fullpage_no;
 
-	polar_write_fullpage(ctl, fullpage, fullpage_no);
-	pg_atomic_add_fetch_u64(&ctl->stat.write_fullpage_count, 1);
+		if (atomic_raise_u64(&ctl->max_fullpage_no_gap, gap) &&
+			gap > FULLPAGE_NUM_PER_FILE)
+			elog(LOG, "fullpage_no reservation fell " UINT64_FORMAT " entries behind, more than one segment; the fullpage sweep margin now covers it",
+				 gap);
+
+		polar_write_fullpage(ctl, fullpage, fullpage_no);
+		pg_atomic_add_fetch_u64(&ctl->stat.write_fullpage_count, 1);
+	}
+	PG_FINALLY();
+	{
+		polar_log_fullpage_end(ctl);
+	}
+	PG_END_TRY();
+
 	return recptr;
 }
 

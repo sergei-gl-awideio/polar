@@ -949,7 +949,7 @@ test_logindex_request_shmem_size(void)
 void
 test_logindex_shmem_startup(void)
 {
-	Assert(test_logindex_snapshot == NULL);
+	/* Reattach after postmaster crash recovery rebuilds shared memory. */
 	test_logindex_snapshot =
 		polar_logindex_snapshot_shmem_init(LOGINDEX_SNAPSHOT_NAME, 3, 32,
 										   polar_wal_logindex_init_lwlock_array,

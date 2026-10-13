@@ -67,6 +67,22 @@ is($ret, '0', 'succ to execute test_checkpoint_ringbuf()!');
 $ret = $node_primary->safe_psql($regress_db, 'select test_fullpage();');
 is($ret, '0', 'succ to execute test_fullpage()!');
 
+# test_fullpage_sweep() needs a relation with more blocks than a logindex
+# memory table has segments (4096), so that its writers roll a table without
+# having to snapshot one page forty thousand times.  fillfactor 10 buys the
+# blocks cheaply.  The checkpoint puts every block on storage so it matches its
+# buffer, which is what the round trip compares, and autovacuum stays off it so
+# nothing sets a hint bit and breaks that afterwards.
+$node_primary->safe_psql(
+	$regress_db, q[
+    CREATE TABLE test_fullpage_sweep_rel (v int) WITH (fillfactor = 10, autovacuum_enabled = false);
+    INSERT INTO test_fullpage_sweep_rel SELECT generate_series(1, 150000);
+    CHECKPOINT;
+]);
+
+$ret = $node_primary->safe_psql($regress_db, 'select test_fullpage_sweep();');
+is($ret, '0', 'succ to execute test_fullpage_sweep()!');
+
 $node_primary->stop;
 
 ## instant recovery parameters

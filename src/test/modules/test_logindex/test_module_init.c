@@ -49,6 +49,7 @@ test_logindex_module_shmem_request(void)
 	RequestAddinShmemSpace(test_mini_trans_request_shmem_size());
 	RequestAddinShmemSpace(test_rel_size_cache_request_shmem_size());
 	RequestAddinShmemSpace(test_ringbuf_request_shmem_size());
+	RequestAddinShmemSpace(test_fullpage_sweep_request_shmem_size());
 }
 
 static void
@@ -61,6 +62,7 @@ test_logindex_module_shmem_startup(void)
 	test_mini_trans_shmem_startup();
 	test_rel_size_cache_shmem_startup();
 	test_ringbuf_shmem_startup();
+	test_fullpage_sweep_shmem_startup();
 }
 
 void

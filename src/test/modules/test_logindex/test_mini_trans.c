@@ -198,7 +198,7 @@ test_mini_trans_request_shmem_size(void)
 void
 test_mini_trans_shmem_startup(void)
 {
-	Assert(test_trans == NULL);
+	/* See test_logindex_shmem_startup() on why this is not asserted NULL. */
 	test_trans = polar_logindex_mini_trans_shmem_init("test_mini_trans");
 	Assert(test_trans);
 }

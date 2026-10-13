@@ -2,7 +2,7 @@
 
 MODULE_big = test_logindex
 OBJS = test_module_init.o test_bitpos.o test_ringbuf.o test_mini_trans.o test_logindex.o \
-	test_polar_rel_size_cache.o test_checkpoint_ringbuf.o test_fullpage.o $(WIN32RES)
+	test_polar_rel_size_cache.o test_checkpoint_ringbuf.o test_fullpage.o test_fullpage_sweep.o $(WIN32RES)
 PGFILEDESC = "test_logindex - test code for log index library"
 
 EXTENSION = test_logindex

@@ -51,3 +51,15 @@ LANGUAGE C STRICT;
 CREATE FUNCTION test_fullpage_replay_counter() RETURNS int
 AS 'MODULE_PATHNAME', 'test_fullpage_replay_counter'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION test_fullpage_sweep() RETURNS int
+AS 'MODULE_PATHNAME', 'test_fullpage_sweep'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION test_fullpage_publish_inflight(bigint) RETURNS int
+AS 'MODULE_PATHNAME', 'test_fullpage_publish_inflight'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION test_fullpage_inflight_occupied() RETURNS int
+AS 'MODULE_PATHNAME', 'test_fullpage_inflight_occupied'
+LANGUAGE C STRICT;
