@@ -76,6 +76,14 @@ typedef struct pg_atomic_uint64
 	/* alignment guaranteed due to being on a 64bit platform */
 	volatile uint64 value;
 } pg_atomic_uint64;
+
+#ifdef HAVE_INT128
+#define PG_HAVE_ATOMIC_U128_SUPPORT
+typedef struct pg_atomic_uint128
+{
+	volatile uint128 value pg_attribute_aligned(16);
+} pg_atomic_uint128;
+#endif
 #endif	/* __x86_64__ */
 
 #endif /* defined(__GNUC__) || defined(__INTEL_COMPILER) */
@@ -236,6 +244,33 @@ pg_atomic_fetch_add_u64_impl(volatile pg_atomic_uint64 *ptr, int64 add_)
 :		"memory", "cc");
 	return res;
 }
+
+#ifdef PG_HAVE_ATOMIC_U128_SUPPORT
+#define PG_HAVE_ATOMIC_COMPARE_EXCHANGE_U128
+static inline bool
+pg_atomic_compare_exchange_u128_impl(volatile pg_atomic_uint128 *ptr,
+									 uint128 *expected, uint128 newval)
+{
+	uint64		exp_lo = (uint64) *expected;
+	uint64		exp_hi = (uint64) (*expected >> 64);
+	uint64		new_lo = (uint64) newval;
+	uint64		new_hi = (uint64) (newval >> 64);
+	uint64		old_lo = exp_lo;
+	uint64		old_hi = exp_hi;
+	bool		ret;
+
+	/* RDX:RAX = expected, RCX:RBX = newval; on failure, observed. */
+	__asm__ __volatile__("lock cmpxchg16b %2"
+					 : "+a" (old_lo), "+d" (old_hi), "+m" (ptr->value)
+					 : "b" (new_lo), "c" (new_hi)
+					 : "memory", "cc");
+
+	ret = old_lo == exp_lo && old_hi == exp_hi;
+	if (!ret)
+		*expected = ((uint128) old_hi << 64) | (uint128) old_lo;
+	return ret;
+}
+#endif
 
 #endif /* __x86_64__ */
 

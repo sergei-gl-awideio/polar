@@ -225,6 +225,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fixed non-working log rotation via pg_ctl logrotate (XCOM-87)
 
 ### Performance
+- Stop serialising every WAL reservation on the insert-position spinlock:
+  replace the spinlock-protected reservation update with a packed 128-bit
+  counter advanced by a single compare-and-swap (TTDB-2523)
+
 
 - Release builds are now linked with link-time optimization (LTO) enabled,
   producing smaller and faster binaries (XCOM-198)
