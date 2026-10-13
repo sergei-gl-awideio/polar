@@ -104,6 +104,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - roaringbitmap
 
 ### Fixed
+- Fixed transaction commits stalling for several seconds under heavy write
+  load when the in-memory WAL queue became full (XCOM-XXX).
+
 
 - Fixed checkpoints on an idle shared-storage primary taking up to 10
   seconds instead of about 0.1 second, and logging "Checkpoint blocked"
@@ -227,7 +230,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Performance
 - Stop serialising every WAL reservation on the insert-position spinlock:
   replace the spinlock-protected reservation update with a packed 128-bit
-  counter advanced by a single compare-and-swap (TTDB-2523)
+  counter advanced by a single compare-and-swap (XCOM-XXX)
 
 
 - Release builds are now linked with link-time optimization (LTO) enabled,
