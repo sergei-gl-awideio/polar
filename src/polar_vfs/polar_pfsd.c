@@ -479,27 +479,117 @@ polar_pfsd_pwrite(int fd, const void *buf, size_t len, off_t offset)
 	return count;
 }
 
+/*
+ * Scratch space for gathering a vectored write into a single request.  Grown on
+ * demand and kept, but never past what one request carries.
+ */
+static char *polar_pfsd_gather_buf = NULL;
+static size_t polar_pfsd_gather_buf_size = 0;
+
+static char *
+polar_pfsd_gather_space(size_t len)
+{
+	if (polar_pfsd_gather_buf_size < len)
+	{
+		char	   *newbuf;
+
+		/*
+		 * Sector aligned.  The copying path imposes no alignment of its own,
+		 * but an aligned source keeps the daemon's copy on its fast path.
+		 */
+		if (posix_memalign((void **) &newbuf, PG_IO_ALIGN_SIZE, len) != 0)
+			return NULL;
+
+		free(polar_pfsd_gather_buf);
+		polar_pfsd_gather_buf = newbuf;
+		polar_pfsd_gather_buf_size = len;
+	}
+
+	return polar_pfsd_gather_buf;
+}
+
+/*
+ * There is no pfsd_pwritev, so a vectored write costs one request per entry
+ * unless the entries can be made into one.  Each request is a round trip through
+ * the daemon to network attached storage, on the order of 100us, so it is worth
+ * some trouble to avoid them.
+ *
+ * Entries already contiguous in memory are one range and go out as they are,
+ * which keeps them inside the registered zero copy region
+ * (polar_zc_main_segment_create() registers the whole main shared memory
+ * segment, so any shmem buffer translates) and off the copying path.  Otherwise
+ * they are copied together and spend one request: at the sizes callers use the
+ * copy costs a fraction of the round trips it removes, even though the gathered
+ * buffer no longer qualifies for zero copy.
+ *
+ * A request carries at most max_pfsd_io_size, so entries are taken in groups
+ * that fit; going past it would only hand polar_pfsd_pwrite() something it has
+ * to split again.
+ */
 static ssize_t
 polar_pfsd_pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
 	ssize_t		count = 0;
-	ssize_t		part;
-	int			i;
+	int			i = 0;
 
-	for (i = 0; i < iovcnt; ++i)
+	while (i < iovcnt)
 	{
-		part = polar_pfsd_pwrite(fd, iov[i].iov_base, iov[i].iov_len, offset);
-		if (part < 0)
+		const char *base = (const char *) iov[i].iov_base;
+		const char *end = base + iov[i].iov_len;
+		size_t		len = iov[i].iov_len;
+		bool		contiguous = true;
+		int			j = i + 1;
+		ssize_t		part;
+
+		/* Take as many entries as one request can carry */
+		while (j < iovcnt && len + iov[j].iov_len <= (size_t) max_pfsd_io_size)
 		{
-			if (i == 0)
-				return -1;
-			else
-				return count;
+			if ((const char *) iov[j].iov_base != end)
+				contiguous = false;
+			end = (const char *) iov[j].iov_base + iov[j].iov_len;
+			len += iov[j].iov_len;
+			j++;
 		}
+
+		if (contiguous)
+			part = polar_pfsd_pwrite(fd, base, len, offset);
+		else
+		{
+			char	   *buf = polar_pfsd_gather_space(len);
+
+			if (buf != NULL)
+			{
+				size_t		done = 0;
+				int			k;
+
+				for (k = i; k < j; k++)
+				{
+					memcpy(buf + done, iov[k].iov_base, iov[k].iov_len);
+					done += iov[k].iov_len;
+				}
+				part = polar_pfsd_pwrite(fd, buf, len, offset);
+			}
+			else
+			{
+				/*
+				 * No scratch space to be had.  Fall back to a request for
+				 * this entry alone and let the loop pick up the rest.
+				 */
+				len = iov[i].iov_len;
+				j = i + 1;
+				part = polar_pfsd_pwrite(fd, base, len, offset);
+			}
+		}
+
+		if (part < 0)
+			return count == 0 ? -1 : count;
+
 		count += part;
 		offset += part;
-		if (part < iov[i].iov_len)
+		if ((size_t) part < len)
 			return count;
+
+		i = j;
 	}
 
 	return count;
