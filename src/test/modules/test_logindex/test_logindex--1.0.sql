@@ -39,3 +39,15 @@ CREATE FUNCTION test_get_polar_parallel_replay_mode()
 RETURNS text
 AS 'MODULE_PATHNAME', 'test_get_polar_parallel_replay_mode'
 LANGUAGE C PARALLEL SAFE;
+
+CREATE FUNCTION test_fullpage_max_no() RETURNS bigint
+AS 'MODULE_PATHNAME', 'test_fullpage_max_no'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION test_fullpage_resume(bigint) RETURNS bigint
+AS 'MODULE_PATHNAME', 'test_fullpage_resume'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION test_fullpage_replay_counter() RETURNS int
+AS 'MODULE_PATHNAME', 'test_fullpage_replay_counter'
+LANGUAGE C STRICT;

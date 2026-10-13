@@ -142,69 +142,81 @@ polar_fullpage_shmem_init(const char *name, polar_ringbuf_t queue, log_index_sna
 	return ctl;
 }
 
+/* Raise a shared counter without moving it backwards. */
+static bool
+atomic_raise_u64(pg_atomic_uint64 *value, uint64 next)
+{
+	uint64		old = pg_atomic_read_u64(value);
+
+	while (next > old)
+	{
+		if (pg_atomic_compare_exchange_u64(value, &old, next))
+			return true;
+	}
+
+	return false;
+}
+
 /*
- * When initializing, we can only get max_fullpage_no from wal file, because we
- * don't save max_fullpage_no in meta file for compatibility.
- * If wal file is removed, it assume fullpage file isn't needed by anyone, just
- * reset fullpage_no to 0
+ * Resume beyond every segment on storage, including preallocated segments.
+ * Replay starts at the checkpoint redo point, so its counter need not cover
+ * snapshots retained from before that point.  Nor can we infer the allocation
+ * frontier from a single WAL record or from the first hole in the directory:
+ * a crash during reclamation can leave holes below surviving segments.
+ *
+ * Scan names rather than probing consecutive files.  ReadDir reports open and
+ * read failures as errors; an incomplete listing must never authorize reuse.
+ * This also works when the fullpage logindex is empty or its WAL is on an old
+ * timeline.  The replay counter remains a lower bound even without any files.
+ * Called at the end of recovery, before this instance starts allocating.
  */
 void
 polar_logindex_calc_max_fullpage_no(polar_fullpage_ctl_t ctl)
 {
-	char		path[MAXPGPATH] = {0};
-	uint64		fullpage_no = 0;
-	struct stat statbuf;
-	XLogSegNo	xlog_seg_no = 0;
-	XLogRecPtr	lsn = InvalidXLogRecPtr;
+	char		path[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+	uint64		next;
 
-	/* set max_fullpage_no when logindex snapshot state is writable */
 	if (!ctl || !polar_logindex_check_state(ctl->logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE))
 		return;
 
-	/* if max_fullpage_no has been set, nothing to do */
-	if (pg_atomic_read_u64(&ctl->max_fullpage_no) > 0)
+	next = pg_atomic_read_u64(&ctl->max_fullpage_no);
+	snprintf(path, sizeof(path), "%s/%s", POLAR_DATA_DIR(),
+			 polar_get_logindex_snapshot_dir(ctl->logindex_snapshot));
+	dir = AllocateDir(path);
+
+	while ((de = ReadDir(dir, path)) != NULL)
 	{
-		elog(LOG, "redo done at max_fullpage_no = %ld", pg_atomic_read_u64(&ctl->max_fullpage_no));
-		return;
+		size_t		hexlen = strspn(de->d_name, "0123456789ABCDEF");
+		uint64		segno;
+
+		/* %08lX is a minimum width, so large segment numbers grow wider. */
+		if (hexlen < 8 || hexlen > 16 || strcmp(de->d_name + hexlen, ".fp") != 0)
+			continue;
+
+		segno = strtou64(de->d_name, NULL, 16);
+		if (segno >= PG_UINT64_MAX / FULLPAGE_NUM_PER_FILE)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("fullpage segment number is too large: %s", de->d_name)));
+
+		next = Max(next, (segno + 1) * FULLPAGE_NUM_PER_FILE);
 	}
 
-	lsn = polar_get_logindex_snapshot_max_lsn(ctl->logindex_snapshot);
+	if (FreeDir(dir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close directory \"%s\": %m", path)));
 
-	if (XLogRecPtrIsInvalid(lsn))
-		return;
-
-	/* check wal file is exist or not */
-	XLByteToSeg(lsn, xlog_seg_no, wal_segment_size);
-	XLogFilePath(path, GetWALInsertionTimeLine(), xlog_seg_no, wal_segment_size);
-
-	/* wal file has been removed olready, we cannot get fullpage_no by lsn */
-	if (polar_lstat(path, &statbuf) < 0)
-	{
-		/*
-		 * Resetting to zero is destructive rather than conservative: the next
-		 * future page write re-issues fullpage_no 0 and starts overwriting
-		 * the fullpage space from the bottom.  Name the file we did not find,
-		 * so a reset because the wal really is gone can be told apart from
-		 * one because the path was built wrong.  The timeline is the first
-		 * field of that name.
-		 */
-		elog(LOG, "fullpage_no reset to 0: no wal file \"%s\" for logindex max lsn %X/%X",
-			 path, LSN_FORMAT_ARGS(lsn));
-		pg_atomic_write_u64(&ctl->max_fullpage_no, 0);
-		return;
-	}
-	else
-	{
-		fullpage_no = polar_xlog_read_fullpage_no(ctl->logindex_snapshot, lsn);
-		pg_atomic_write_u64(&ctl->max_fullpage_no, fullpage_no);
-	}
-
-	elog(LOG, "redo done at max_fullpage_no = %ld", pg_atomic_read_u64(&ctl->max_fullpage_no));
+	atomic_raise_u64(&ctl->max_fullpage_no, next);
+	elog(LOG, "redo done at max_fullpage_no = " UINT64_FORMAT,
+		 pg_atomic_read_u64(&ctl->max_fullpage_no));
 }
 
 /*
- * POLAR: we update max_fullpage_no when replay wal, we guarantee that fullpage_no
- * keep the same order with wal lsn, so last fullpage_no must be max_fullpage_no
+ * max_fullpage_no is the next number to allocate, not the last one replayed.
+ * Keep the maximum: allocation order need not be the same as WAL order.
  */
 void
 polar_update_max_fullpage_no(polar_fullpage_ctl_t ctl, uint64 fullpage_no)
@@ -212,7 +224,12 @@ polar_update_max_fullpage_no(polar_fullpage_ctl_t ctl, uint64 fullpage_no)
 	if (!ctl)
 		return;
 
-	pg_atomic_write_u64(&ctl->max_fullpage_no, fullpage_no);
+	if (fullpage_no == PG_UINT64_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("fullpage snapshot counter exhausted")));
+
+	atomic_raise_u64(&ctl->max_fullpage_no, fullpage_no + 1);
 }
 
 /*

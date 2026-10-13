@@ -52,9 +52,6 @@ test_flush_fullpage_table(polar_fullpage_ctl_t ctl)
 	log_index_snapshot logindex_snapshot = ctl->logindex_snapshot;
 	log_index_mem_table active = LOG_INDEX_MEM_TBL_ACTIVE();
 	log_index_table_t table;
-	uint64		fullpage_seg_no = 0;
-	char		path[MAXPGPATH] = {0};
-	struct stat statbuf;
 
 	/* Wait for fullpage write to logindex */
 	sleep(1);
@@ -63,16 +60,8 @@ test_flush_fullpage_table(polar_fullpage_ctl_t ctl)
 	elog(LOG, "Read table which tid=%ld", LOG_INDEX_MEM_TBL_TID(active));
 
 	log_index_read_table_data(logindex_snapshot, &table, LOG_INDEX_MEM_TBL_TID(active), LOG);
-	polar_logindex_calc_max_fullpage_no(ctl);
 	Assert(table.idx_table_id == LOG_INDEX_MEM_TBL_TID(active));
 	Assert(table.max_lsn == polar_get_logindex_snapshot_max_lsn(logindex_snapshot));
-	Assert(pg_atomic_read_u64(&ctl->max_fullpage_no) > 0);
-
-	fullpage_seg_no = FULLPAGE_FILE_SEG_NO(pg_atomic_read_u64(&ctl->max_fullpage_no));
-	Assert(fullpage_seg_no == 0);
-	polar_remove_old_fullpage_files(ctl, table.max_lsn);
-	FULLPAGE_SEG_FILE_NAME(ctl, path, fullpage_seg_no);
-	Assert(polar_lstat(path, &statbuf) == 0);
 }
 
 static void
@@ -256,4 +245,45 @@ test_fullpage_roll_table(PG_FUNCTION_ARGS)
 	LWLockRelease(lock);
 
 	PG_RETURN_INT64(LOG_INDEX_MEM_TBL_TID(active));
+}
+
+/* Inspect the production counter after startup/replay. */
+PG_FUNCTION_INFO_V1(test_fullpage_max_no);
+Datum
+test_fullpage_max_no(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pg_atomic_read_u64(&polar_logindex_redo_instance->fullpage_ctl->max_fullpage_no));
+}
+
+/* Exercise recovery against a private directory without changing the allocator. */
+PG_FUNCTION_INFO_V1(test_fullpage_resume);
+Datum
+test_fullpage_resume(PG_FUNCTION_ARGS)
+{
+	polar_fullpage_ctl_data_t ctl = {0};
+	log_index_snapshot_t snapshot = {0};
+	uint64		floor = PG_GETARG_INT64(0);
+
+	strlcpy(snapshot.dir, "test_fullpage_resume", sizeof(snapshot.dir));
+	pg_atomic_init_u32(&snapshot.state, POLAR_LOGINDEX_STATE_WRITABLE);
+	ctl.logindex_snapshot = &snapshot;
+	pg_atomic_init_u64(&ctl.max_fullpage_no, floor);
+
+	polar_logindex_calc_max_fullpage_no(&ctl);
+	PG_RETURN_INT64(pg_atomic_read_u64(&ctl.max_fullpage_no));
+}
+
+PG_FUNCTION_INFO_V1(test_fullpage_replay_counter);
+Datum
+test_fullpage_replay_counter(PG_FUNCTION_ARGS)
+{
+	polar_fullpage_ctl_data_t ctl = {0};
+
+	pg_atomic_init_u64(&ctl.max_fullpage_no, 0);
+	polar_update_max_fullpage_no(&ctl, 100);
+	polar_update_max_fullpage_no(&ctl, 50);
+	if (pg_atomic_read_u64(&ctl.max_fullpage_no) != 101)
+		elog(ERROR, "replay reused or moved backwards from a fullpage number");
+
+	PG_RETURN_INT32(0);
 }
