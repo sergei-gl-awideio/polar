@@ -73,6 +73,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Increase the default value of `polar_wal_buffer_insert_locks` from 8 to
+  256. Raise MAX_SIMUL_LWLOCKS from 200 to 1024 for headroom when more WAL
+  insertion locks are held in flight (XCOM-XXX)
+
 - Rebased on PolarDB for PostgreSQL 17.11.1.0, which includes all changes
   from the PostgreSQL 17.11 minor release (XCOM-206)
 - Added exponential backoff for the `Failed to get the instance memory
