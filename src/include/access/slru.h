@@ -258,7 +258,7 @@ extern int	polar_slru_copy_shared_dir(SlruCtl ctl, SlruScanCallback copy_conditi
 extern void polar_slru_remove_local_cache_file(SlruCtl ctl);
 extern void polar_slru_reg_local_cache(SlruCtl ctl, polar_local_cache cache);
 
-extern void polar_slru_invalid_page(SlruCtl ctl, int pageno);
+extern void polar_slru_invalid_page(SlruCtl ctl, int pageno, bool discard_dirty);
 extern void polar_slru_append_page(SlruCtl ctl, int slotno, bool only_update);
 extern void polar_slru_promote(SlruCtl ctl);
 extern bool polar_slru_page_physical_exists(SlruCtl ctl, int pageno);

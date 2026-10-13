@@ -401,6 +401,10 @@ typedef struct log_index_snapshot_t
 	uint64		max_allocated_seg_no;
 	polar_local_cache segment_cache;
 	struct Latch *bg_worker_latch;
+
+	/* Last table named by the meta file; protected by LOG_INDEX_IO_LOCK. */
+	log_idx_table_id_t last_published_table_id;
+
 	log_index_mem_table_t mem_table[FLEXIBLE_ARRAY_MEMBER];
 } log_index_snapshot_t;
 

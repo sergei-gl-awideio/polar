@@ -166,6 +166,27 @@ log_index_table_saved_before_promote(log_index_snapshot logindex_snapshot, log_i
 	return saved;
 }
 
+/* Write dirty bloom pages before publishing metadata that names their tables. */
+static void
+log_index_flush_bloom(log_index_snapshot logindex_snapshot)
+{
+	SimpleLruWriteAll(&logindex_snapshot->bloom_ctl, true);
+}
+
+/*
+ * Publish the tables written since the last call by writing the meta file.
+ * The in-memory meta already names them; this is what makes that durable and
+ * visible to anyone reading meta from storage.
+ */
+static void
+log_index_flush_meta(log_index_snapshot logindex_snapshot)
+{
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+	if (logindex_snapshot->last_published_table_id != logindex_snapshot->meta.max_idx_table_id)
+		log_index_write_meta(logindex_snapshot, &logindex_snapshot->meta, true);
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+}
+
 bool
 polar_logindex_table_flushable(log_index_snapshot logindex_snapshot, log_index_mem_table table)
 {
@@ -311,6 +332,9 @@ log_index_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr checkpoin
 	}
 	while (need_flush);
 
+	/* Publish this round's work and any remainder left by forced saves. */
+	log_index_flush_meta(logindex_snapshot);
+
 	log_index_close_seg_fd(&seg_fd);
 
 	return write_done;
@@ -329,11 +353,17 @@ polar_logindex_flush_table(log_index_snapshot logindex_snapshot, XLogRecPtr chec
 }
 
 void
-polar_logindex_invalid_bloom_cache(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid)
+polar_logindex_invalid_bloom_cache(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid,
+								   bool discard_dirty)
 {
 	int			pageno = LOG_INDEX_TBL_BLOOM_PAGE_NO(tid);
 
-	polar_slru_invalid_page(&logindex_snapshot->bloom_ctl, pageno);
+	/*
+	 * Reader refreshes must preserve dirty pages: a neighboring table's bloom
+	 * may share the page and still await publication.  Discard only when
+	 * writers are excluded and storage is authoritative.
+	 */
+	polar_slru_invalid_page(&logindex_snapshot->bloom_ctl, pageno, discard_dirty);
 }
 
 static bool
@@ -404,7 +434,8 @@ log_index_update_replica_table_state(log_index_snapshot logindex_snapshot, log_i
 			if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_INACTIVE
 				&& LOG_INDEX_MEM_TBL_TID(table) <= max_saved_tid)
 			{
-				polar_logindex_invalid_bloom_cache(logindex_snapshot, LOG_INDEX_MEM_TBL_TID(table));
+				/* Promotion may already have enabled a neighboring bloom's writer. */
+				polar_logindex_invalid_bloom_cache(logindex_snapshot, LOG_INDEX_MEM_TBL_TID(table), false);
 				LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
 			}
 
@@ -444,6 +475,13 @@ log_index_replica_bg_write(log_index_snapshot logindex_snapshot)
 	last_max_table_id = max_tid;
 
 	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+
+	/* Promotion can finish after the caller selected the replica path. */
+	if (polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE))
+	{
+		LWLockRelease(LOG_INDEX_IO_LOCK);
+		return true;
+	}
 
 	if (log_index_get_meta(logindex_snapshot, meta))
 	{
@@ -540,6 +578,9 @@ polar_logindex_snapshot_base_init(log_index_snapshot logindex_snapshot, XLogRecP
 	}
 
 	POLAR_LOG_LOGINDEX_META_INFO(meta);
+
+	/* Discard publication state from a previous initialization. */
+	logindex_snapshot->last_published_table_id = meta->max_idx_table_id;
 
 	logindex_snapshot_init_promoted_info(logindex_snapshot);
 	logindex_snapshot->max_idx_table_id = meta->max_idx_table_id;
@@ -654,6 +695,8 @@ polar_logindex_snapshot_shmem_init(const char *name, uint64 logindex_mem_tbl_siz
 	{
 		POLAR_ASSERT_PANIC(!found_snapshot && !found_locks);
 		logindex_snapshot->mem_tbl_size = logindex_mem_tbl_size;
+
+		logindex_snapshot->last_published_table_id = LOG_INDEX_TABLE_INVALID_ID;
 
 		pg_atomic_init_u32(&logindex_snapshot->state, 0);
 
@@ -860,6 +903,13 @@ log_index_write_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *met
 
 	snprintf(meta_path, MAXPGPATH, "%s/%s/%s", POLAR_DATA_DIR(), logindex_snapshot->dir, LOG_INDEX_META_FILE);
 
+	/*
+	 * Meta is what makes a table reachable, so nothing it names may still
+	 * have its bloom sitting in the lru.  Doing this here rather than at the
+	 * call sites means a new way to publish meta cannot forget it.
+	 */
+	log_index_flush_bloom(logindex_snapshot);
+
 	if (meta->max_lsn != InvalidXLogRecPtr)
 		meta->start_lsn = meta->max_lsn;
 
@@ -894,6 +944,9 @@ log_index_write_meta(log_index_snapshot logindex_snapshot, log_index_meta_t *met
 		ereport(PANIC, (errmsg("could not flush file \"%s\": \"%s\"", meta_path, strerror(save_errno))));
 	}
 
+	/* Whatever was owed is now on storage */
+	logindex_snapshot->last_published_table_id = meta->max_idx_table_id;
+
 	/* fd stays open, see log_index_get_meta_file() */
 }
 
@@ -908,6 +961,7 @@ log_index_force_save_table(log_index_snapshot logindex_snapshot, log_index_mem_t
 	static log_idx_table_id_t force_table = LOG_INDEX_TABLE_INVALID_ID;
 	log_index_meta_t *meta = &logindex_snapshot->meta;
 	log_idx_table_id_t tid = LOG_INDEX_MEM_TBL_TID(table);
+	bool		writable = polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE);
 
 	if (force_table != tid)
 	{
@@ -915,26 +969,28 @@ log_index_force_save_table(log_index_snapshot logindex_snapshot, log_index_mem_t
 		force_table = tid;
 	}
 
-	if (!polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE))
+	if (!writable)
 	{
-		log_idx_table_id_t max_tid;
-
 		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
 
-		if (log_index_get_meta(logindex_snapshot, meta))
-			max_tid = meta->max_idx_table_id;
-		else
-			elog(FATAL, "Failed to get logindex meta from storage");
-
-		LWLockRelease(LOG_INDEX_IO_LOCK);
-
-		if (max_tid >= LOG_INDEX_MEM_TBL_TID(table))
+		/* Serialize the refresh and bloom invalidation with promotion. */
+		writable = polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE);
+		if (!writable)
 		{
-			polar_logindex_invalid_bloom_cache(logindex_snapshot, LOG_INDEX_MEM_TBL_TID(table));
-			LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+			if (!log_index_get_meta(logindex_snapshot, meta))
+				elog(FATAL, "Failed to get logindex meta from storage");
+
+			if (meta->max_idx_table_id >= tid)
+			{
+				polar_logindex_invalid_bloom_cache(logindex_snapshot, tid, true);
+				LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+			}
 		}
+		LWLockRelease(LOG_INDEX_IO_LOCK);
 	}
-	else
+
+	/* A reader that waited across promotion must now use the writer path. */
+	if (writable)
 	{
 		if (log_index_table_flushable(logindex_snapshot, table))
 		{
@@ -1350,14 +1406,9 @@ log_index_save_bloom(log_index_snapshot logindex_snapshot, log_idx_table_id_t ti
 	lru_bloom = log_index_get_bloom_lru(logindex_snapshot, tid, &slot);
 	memcpy(lru_bloom, bloom, LOG_INDEX_FILE_TBL_BLOOM_SIZE);
 	shared->page_dirty[slot] = true;
-
-	/*
-	 * If this tid write from offset=0, then this segment file does not exits,
-	 * O_CREAT flag will be set to open this file.Otherwise we will open this
-	 * segment file without O_CREAT flag to append bloom data.
-	 */
-	polar_slru_append_page(&logindex_snapshot->bloom_ctl, slot, LOG_INDEX_FILE_TABLE_SEGMENT_OFFSET(tid) != 0);
 	LWLockRelease(lock);
+
+	/* Metadata publication flushes these pages through SimpleLruWriteAll(). */
 }
 
 static int
@@ -1767,6 +1818,15 @@ log_index_read_table(log_index_snapshot logindex_snapshot, log_idx_table_id_t ti
 	return data;
 }
 
+/*
+ * Write and sync table data before advancing the in-memory meta or releasing
+ * the memory table for reuse.  Both background and forced writes use the same
+ * publication watermark, protected by LOG_INDEX_IO_LOCK.  Publish at most one
+ * segment's worth of new tables at a time; the flush round publishes any
+ * remainder, including work done by the forced-save path.
+ *
+ * Active-table writes do not advance meta and do not owe a publication.
+ */
 bool
 log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table table,
 					  log_index_seg_fd_t *seg_fd)
@@ -1830,9 +1890,12 @@ log_index_write_table(log_index_snapshot logindex_snapshot, log_index_mem_table 
 				min_seg->min_idx_table_id = min_seg->segment_no * LOG_INDEX_TABLE_NUM_PER_FILE + 1;
 			}
 
-			log_index_write_meta(logindex_snapshot, meta, true);
+			if (meta->max_idx_table_id - logindex_snapshot->last_published_table_id >=
+				LOG_INDEX_TABLE_NUM_PER_FILE)
+				log_index_write_meta(logindex_snapshot, meta, true);
 
 			succeed = true;
+
 			LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
 		}
 	}
@@ -2221,7 +2284,7 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot logindex_snapshot, 
 	int			mid = 0;
 	log_idx_table_id_t tid = 0,
 				min_tid = 0;
-	uint32		state = pg_atomic_read_u32(&logindex_snapshot->state);
+	uint32		state;
 
 	/*
 	 * If it's Primary node, we only load tables whose min_lsn is less than
@@ -2234,6 +2297,18 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot logindex_snapshot, 
 	 */
 
 	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+
+	/*
+	 * Initialization must load storage even on a primary. Runtime reloads
+	 * must not replace a writer's newer metadata or memory tables.
+	 */
+	state = pg_atomic_read_u32(&logindex_snapshot->state);
+	if ((state & POLAR_LOGINDEX_STATE_INITIALIZED) &&
+		(state & POLAR_LOGINDEX_STATE_WRITABLE))
+	{
+		LWLockRelease(LOG_INDEX_IO_LOCK);
+		return;
+	}
 
 	if (log_index_get_meta(logindex_snapshot, meta))
 		new_max_idx_table_id = meta->max_idx_table_id;
@@ -2304,7 +2379,9 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot logindex_snapshot, 
 			memcpy(&mem_tbl->data, &table, sizeof(log_index_table_t));
 			LOG_INDEX_MEM_TBL_SET_STATE(mem_tbl, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
 			LOG_INDEX_MEM_TBL_FREE_HEAD(mem_tbl) = LOG_INDEX_MEM_TBL_SEG_NUM;
-			polar_logindex_invalid_bloom_cache(logindex_snapshot, tid);
+			/* Only initialization excludes writers for the whole load. */
+			polar_logindex_invalid_bloom_cache(logindex_snapshot, tid,
+											  !(state & POLAR_LOGINDEX_STATE_INITIALIZED));
 			LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(mem_tbl));
 
 			POLAR_ASSERT_PANIC(table.idx_table_id == tid);
@@ -2471,6 +2548,7 @@ polar_replica_promote_logindex(log_index_snapshot logindex_snapshot, bool missin
 	else
 		elog(FATAL, "Failed to read logindex meta from shared storage");
 
+	logindex_snapshot->last_published_table_id = meta->max_idx_table_id;
 	shared->polar_replica_promoting = true;
 	pg_atomic_fetch_or_u32(&logindex_snapshot->state, POLAR_LOGINDEX_STATE_WRITABLE);
 	LWLockRelease(LOG_INDEX_IO_LOCK);

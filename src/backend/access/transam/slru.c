@@ -2306,7 +2306,7 @@ polar_slru_promote(SlruCtl ctl)
  * POLAR: Scan SimpleLru and force to invalid specific page
  */
 void
-polar_slru_invalid_page(SlruCtl ctl, int pageno)
+polar_slru_invalid_page(SlruCtl ctl, int pageno, bool discard_dirty)
 {
 	SlruShared	shared = ctl->shared;
 	int			slotno;
@@ -2330,9 +2330,16 @@ polar_slru_invalid_page(SlruCtl ctl, int pageno)
 				continue;
 			}
 
-			POLAR_ASSERT_PANIC(shared->page_status[slotno] == SLRU_PAGE_EMPTY ||
-							   (shared->page_status[slotno] == SLRU_PAGE_VALID &&
-								!shared->page_dirty[slotno]));
+			/*
+			 * A caller that has not said discard_dirty wants a stale
+			 * cache entry dropped so the next read comes from storage.  A
+			 * dirty page is not stale: memory is ahead of storage, and
+			 * dropping it loses what has not been written yet.  Leave it.
+			 */
+			if (!discard_dirty &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				shared->page_dirty[slotno])
+				break;
 
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			shared->page_dirty[slotno] = false;

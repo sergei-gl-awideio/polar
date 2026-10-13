@@ -548,14 +548,17 @@ log_index_check_hollow_table(log_index_snapshot logindex_snapshot, log_index_pag
 {
 	LOG_INDEX_COPY_META(meta);
 
-	if (meta->max_idx_table_id < tid)
+	/* A writer's shared metadata may be ahead of its deferred metadata file. */
+	if (meta->max_idx_table_id < tid &&
+		!polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE))
 	{
 		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
 
-		if (log_index_get_meta(logindex_snapshot, &logindex_snapshot->meta))
-			memcpy(meta, &logindex_snapshot->meta, sizeof(log_index_meta_t));
-		else
+		/* Promotion may have completed while we waited for the I/O lock. */
+		if (!polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_WRITABLE) &&
+			!log_index_get_meta(logindex_snapshot, &logindex_snapshot->meta))
 			elog(FATAL, "Failed to get logindex meta from storage");
+		memcpy(meta, &logindex_snapshot->meta, sizeof(log_index_meta_t));
 
 		LWLockRelease(LOG_INDEX_IO_LOCK);
 	}
@@ -592,7 +595,7 @@ log_index_check_bloom_not_exists(log_index_snapshot logindex_snapshot, log_index
 	if (bloom->idx_table_id == LOG_INDEX_TABLE_INVALID_ID)
 	{
 		LWLockRelease(lock);
-		polar_logindex_invalid_bloom_cache(logindex_snapshot, tid);
+		polar_logindex_invalid_bloom_cache(logindex_snapshot, tid, false);
 		bloom = log_index_get_tbl_bloom(logindex_snapshot, tid);
 	}
 

@@ -137,7 +137,8 @@ extern XLogRecPtr polar_get_logindex_snapshot_storage_min_lsn(log_index_snapshot
 extern const char *polar_get_logindex_snapshot_dir(log_index_snapshot logindex_snapshot);
 
 extern void polar_load_logindex_snapshot_from_storage(log_index_snapshot logindex_snapshot, XLogRecPtr start_lsn);
-extern void polar_logindex_invalid_bloom_cache(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid);
+extern void polar_logindex_invalid_bloom_cache(log_index_snapshot logindex_snapshot, log_idx_table_id_t tid,
+											   bool discard_dirty);
 
 extern void polar_logindex_set_bgworker_latch(log_index_snapshot logindex_snapshot, struct Latch *latch);
 extern void polar_replica_promote_logindex(log_index_snapshot logindex_snapshot, bool missing_ok);

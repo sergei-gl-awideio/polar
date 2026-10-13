@@ -38,6 +38,8 @@
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "storage/shmem.h"
+#include "tcop/tcopprot.h"
 #include "test_module_init.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -54,6 +56,9 @@ static BackgroundWorkerHandle *bgwriter_handle;
 static bool shutdown_requested = false;
 
 static log_index_snapshot test_logindex_snapshot = NULL;
+#define TEST_PUBLICATION_TABLES (LOG_INDEX_TABLE_NUM_PER_FILE + 8)
+static log_index_snapshot test_publication_snapshot = NULL;
+static pg_atomic_uint32 *refresh_worker_done;
 static XLogRecPtr test_max_lsn = InvalidXLogRecPtr;
 static XLogRecPtr test_start_lsn[TEST_MAX_BLOCK_NUMBER];
 static XLogRecPtr test_end_lsn[TEST_MAX_BLOCK_NUMBER];
@@ -66,13 +71,16 @@ PGDLLEXPORT void test_logindex_bgwriter_main(Datum main_arg);
 static bool
 test_logindex_table_flushable(log_index_snapshot logindex_snapshot, log_index_mem_table table)
 {
-	if (strcmp(logindex_snapshot->dir, LOGINDEX_SNAPSHOT_NAME) == 0)
+	if (strcmp(logindex_snapshot->dir, LOGINDEX_SNAPSHOT_NAME) == 0 ||
+		strcmp(logindex_snapshot->dir, "test_logindex_publication") == 0)
 		return true;
 	else if (prev_flushable_hook)
 		return prev_flushable_hook(logindex_snapshot, table);
 	else
 		return polar_logindex_table_flushable(logindex_snapshot, table);
 }
+
+PGDLLEXPORT void test_logindex_refresh_main(Datum main_arg);
 
 static void
 test_insert_lsn_to_mem(log_index_snapshot logindex_snapshot, BufferTag *tag, XLogRecPtr max_lsn, uint32 key)
@@ -871,6 +879,367 @@ test_force_flush_full_table(log_index_snapshot logindex_snapshot, BufferTag *tag
 	LWLockRelease(lock);
 }
 
+
+/* Read the published metadata, without replacing the writer's shared copy. */
+static log_idx_table_id_t
+test_published_tid(log_index_snapshot logindex_snapshot)
+{
+	log_index_meta_t meta;
+
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_SHARED);
+	Assert(log_index_get_meta(logindex_snapshot, &meta));
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+	return meta.max_idx_table_id;
+}
+
+/* Readers deliberately block behind a simulated promotion below. */
+void
+test_logindex_refresh_main(Datum main_arg)
+{
+	log_index_snapshot logindex_snapshot = test_publication_snapshot;
+	int mode = DatumGetInt32(main_arg);
+
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+
+	switch (mode)
+	{
+		case 0:
+		{
+			log_index_mem_table table = LOG_INDEX_MEM_TBL(1);
+
+			LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+			log_index_force_save_table(logindex_snapshot, table);
+			LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+			break;
+		}
+		case 1:
+			polar_load_logindex_snapshot_from_storage(logindex_snapshot, InvalidXLogRecPtr);
+			break;
+		case 2:
+			polar_logindex_bg_write(logindex_snapshot);
+			break;
+		case 3:
+		{
+			BufferTag tag;
+			log_index_page_iter iter;
+			log_index_lsn_info entry;
+			XLogRecPtr lsn = ((XLogRecPtr) 2 << 32) + LSN_TEST_STEP;
+
+			MemSet(&tag, 0, sizeof(tag));
+			tag.spcOid = 30;
+			tag.dbOid = 31;
+			tag.relNumber = 32;
+			tag.forkNum = MAIN_FORKNUM;
+			tag.blockNum = 2;
+			iter = polar_logindex_create_page_iterator(logindex_snapshot, &tag,
+													 lsn - 1, lsn + 1, false);
+			entry = polar_logindex_page_iterator_next(iter);
+			if (entry == NULL || entry->lsn != lsn)
+				elog(ERROR, "metadata refresh race lost the indexed page");
+			polar_logindex_release_page_iterator(iter);
+			break;
+		}
+		default:
+			elog(ERROR, "unexpected metadata refresh test mode %d", mode);
+	}
+	pg_atomic_write_u32(refresh_worker_done, 1);
+	proc_exit(0);
+}
+
+/*
+ * The file still says zero; tables 1 and 2 have been written without publishing.
+ * Queue each reader while read-only, then make the snapshot writable with newer
+ * shared metadata before letting the reader acquire the I/O lock. No timing
+ * assumption is needed: nwaiters proves it has reached the contended lock.
+ */
+static void
+test_logindex_refresh_race(log_index_snapshot logindex_snapshot)
+{
+	log_index_meta_t saved_meta = logindex_snapshot->meta;
+	log_index_mem_table table = LOG_INDEX_MEM_TBL(1);
+	int mode;
+
+	Assert(saved_meta.max_idx_table_id == 2);
+	Assert(test_published_tid(logindex_snapshot) == 0);
+	for (mode = 0; mode < 4; mode++)
+	{
+		BackgroundWorker worker = {0};
+		BackgroundWorkerHandle *handle;
+		pid_t pid;
+		int waits;
+
+		pg_atomic_write_u32(refresh_worker_done, 0);
+		/* Force-save needs an unwritten table; the iterator needs a cache miss. */
+		LOG_INDEX_MEM_TBL_SET_STATE(table, mode == 0 ? LOG_INDEX_MEM_TBL_STATE_INACTIVE :
+									  mode == 3 ? LOG_INDEX_MEM_TBL_STATE_FREE :
+									  LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+		pg_atomic_fetch_and_u32(&logindex_snapshot->state, ~POLAR_LOGINDEX_STATE_WRITABLE);
+		SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
+		logindex_snapshot->meta.max_idx_table_id = 0;
+		logindex_snapshot->meta.max_lsn = InvalidXLogRecPtr;
+		SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
+
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = BGW_NEVER_RESTART;
+		strlcpy(worker.bgw_library_name, "test_logindex", BGW_MAXLEN);
+		strlcpy(worker.bgw_function_name, "test_logindex_refresh_main", BGW_MAXLEN);
+		strlcpy(worker.bgw_name, "test_logindex_refresh", BGW_MAXLEN);
+		strlcpy(worker.bgw_type, "test_logindex_refresh", BGW_MAXLEN);
+		worker.bgw_main_arg = Int32GetDatum(mode);
+		worker.bgw_notify_pid = MyProcPid;
+		if (!RegisterDynamicBackgroundWorker(&worker, &handle) ||
+			WaitForBackgroundWorkerStartup(handle, &pid) != BGWH_STARTED)
+			elog(ERROR, "could not start metadata refresh worker");
+
+		for (waits = 0; pg_atomic_read_u32(&LOG_INDEX_IO_LOCK->nwaiters) == 0; waits++)
+		{
+			if (waits >= 10000)
+				elog(ERROR, "metadata refresh worker %d did not reach the I/O lock", mode);
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+		}
+
+		SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
+		logindex_snapshot->meta = saved_meta;
+		if (mode == 0)
+		{
+			/* The resumed force-save must write table 2 itself. */
+			logindex_snapshot->meta.max_idx_table_id = 1;
+			logindex_snapshot->meta.max_lsn = (LOG_INDEX_MEM_TBL(0))->data.max_lsn;
+		}
+		SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
+		pg_atomic_fetch_or_u32(&logindex_snapshot->state, POLAR_LOGINDEX_STATE_WRITABLE);
+		LWLockRelease(LOG_INDEX_IO_LOCK);
+
+		if (WaitForBackgroundWorkerShutdown(handle) != BGWH_STOPPED ||
+			pg_atomic_read_u32(refresh_worker_done) != 1 ||
+			logindex_snapshot->meta.max_idx_table_id != 2)
+			elog(ERROR, "metadata refresh worker %d replaced the writer metadata", mode);
+		Assert(logindex_snapshot->meta.max_lsn == saved_meta.max_lsn);
+		Assert(test_published_tid(logindex_snapshot) == 0);
+		LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+	}
+}
+
+/*
+ * The replica-state updater is also used at the end of promotion. Hold its
+ * saved table's lock while a new writer dirties the neighboring bloom, then
+ * let the updater invalidate its old cache entry. The page belongs to both.
+ */
+static void
+test_logindex_bloom_refresh_race(log_index_snapshot logindex_snapshot)
+{
+	log_idx_table_id_t saved_tid = logindex_snapshot->meta.max_idx_table_id;
+	log_idx_table_id_t next_tid = saved_tid + 1;
+	log_index_mem_table saved = LOG_INDEX_MEM_TBL((saved_tid - 1) % logindex_snapshot->mem_tbl_size);
+	log_index_mem_table next = LOG_INDEX_MEM_TBL((next_tid - 1) % logindex_snapshot->mem_tbl_size);
+	BackgroundWorker worker = {0};
+	BackgroundWorkerHandle *handle;
+	log_index_table_bloom_t *bloom;
+	char *expected_bloom = palloc(LOG_INDEX_FILE_TBL_BLOOM_SIZE);
+	BufferTag tag;
+	pid_t pid;
+	int waits;
+	bool valid;
+
+	Assert(LOG_INDEX_TBL_BLOOM_PAGE_NO(saved_tid) == LOG_INDEX_TBL_BLOOM_PAGE_NO(next_tid));
+	Assert(test_published_tid(logindex_snapshot) == saved_tid);
+	MemSet(&tag, 0, sizeof(tag));
+	tag.spcOid = 30;
+	tag.dbOid = 31;
+	tag.relNumber = 32;
+	tag.forkNum = MAIN_FORKNUM;
+	tag.blockNum = next_tid;
+	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+						  ((XLogRecPtr) next_tid << 32) + LSN_TEST_STEP);
+	tag.blockNum++;
+	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+						  ((XLogRecPtr) (next_tid + 1) << 32) + LSN_TEST_STEP);
+
+	LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(saved), LW_EXCLUSIVE);
+	LOG_INDEX_MEM_TBL_SET_STATE(saved, LOG_INDEX_MEM_TBL_STATE_INACTIVE);
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+	pg_atomic_fetch_and_u32(&logindex_snapshot->state, ~POLAR_LOGINDEX_STATE_WRITABLE);
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+	pg_atomic_write_u32(refresh_worker_done, 0);
+
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	strlcpy(worker.bgw_library_name, "test_logindex", BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, "test_logindex_refresh_main", BGW_MAXLEN);
+	strlcpy(worker.bgw_name, "test_logindex_bloom_refresh", BGW_MAXLEN);
+	strlcpy(worker.bgw_type, "test_logindex_bloom_refresh", BGW_MAXLEN);
+	worker.bgw_main_arg = Int32GetDatum(2);
+	worker.bgw_notify_pid = MyProcPid;
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle) ||
+		WaitForBackgroundWorkerStartup(handle, &pid) != BGWH_STARTED)
+		elog(ERROR, "could not start bloom refresh worker");
+
+	for (waits = 0; pg_atomic_read_u32(&LOG_INDEX_MEM_TBL_LOCK(saved)->nwaiters) == 0; waits++)
+	{
+		if (waits >= 10000)
+			elog(ERROR, "bloom refresh worker did not reach the saved table lock");
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+	}
+
+	/* The updater has read the old metadata and is now waiting on saved. */
+	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
+	pg_atomic_fetch_or_u32(&logindex_snapshot->state, POLAR_LOGINDEX_STATE_WRITABLE);
+	LWLockRelease(LOG_INDEX_IO_LOCK);
+	LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(next), LW_EXCLUSIVE);
+	log_index_force_save_table(logindex_snapshot, next);
+	LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(next));
+	Assert(logindex_snapshot->meta.max_idx_table_id == next_tid);
+	Assert(test_published_tid(logindex_snapshot) == saved_tid);
+	bloom = log_index_get_tbl_bloom(logindex_snapshot, next_tid);
+	Assert(bloom->idx_table_id == next_tid);
+	memcpy(expected_bloom, bloom, LOG_INDEX_FILE_TBL_BLOOM_SIZE);
+	LWLockRelease(SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl,
+										 LOG_INDEX_TBL_BLOOM_PAGE_NO(next_tid)));
+	LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(saved));
+
+	if (WaitForBackgroundWorkerShutdown(handle) != BGWH_STOPPED ||
+		pg_atomic_read_u32(refresh_worker_done) != 1)
+		elog(ERROR, "bloom refresh worker did not finish");
+	Assert(LOG_INDEX_MEM_TBL_STATE(saved) == LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+	bloom = log_index_get_tbl_bloom(logindex_snapshot, next_tid);
+	valid = memcmp(bloom, expected_bloom, LOG_INDEX_FILE_TBL_BLOOM_SIZE) == 0;
+	LWLockRelease(SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl,
+										 LOG_INDEX_TBL_BLOOM_PAGE_NO(next_tid)));
+	if (!valid)
+		elog(ERROR, "replica state refresh discarded the neighboring dirty bloom");
+
+	/* Publication must still flush that bloom, and disk readback must find it. */
+	polar_logindex_flush_table(logindex_snapshot, next->data.max_lsn, false);
+	Assert(test_published_tid(logindex_snapshot) == next_tid);
+	polar_logindex_invalid_bloom_cache(logindex_snapshot, next_tid, false);
+	bloom = log_index_get_tbl_bloom(logindex_snapshot, next_tid);
+	valid = memcmp(bloom, expected_bloom, LOG_INDEX_FILE_TBL_BLOOM_SIZE) == 0;
+	LWLockRelease(SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl,
+										 LOG_INDEX_TBL_BLOOM_PAGE_NO(next_tid)));
+	if (!valid)
+		elog(ERROR, "publication lost the neighboring bloom on disk");
+	pfree(expected_bloom);
+}
+
+/*
+ * Exercise the two writers against one publication window.  One LSN prefix
+ * per table makes a small, deterministic backlog without filling every table.
+ */
+static void
+test_logindex_publication(void)
+{
+	log_index_snapshot logindex_snapshot = test_publication_snapshot;
+	log_index_seg_fd_t seg_fd = LOG_INDEX_SEG_FD_EMPTY;
+	log_idx_table_id_t tid;
+	log_idx_table_id_t tables = LOG_INDEX_TABLE_NUM_PER_FILE + 3;
+	log_index_table_t *disk_table = palloc(sizeof(log_index_table_t));
+	BufferTag tag;
+	log_index_mem_table table;
+	log_index_table_bloom_t *bloom;
+	XLogRecPtr checkpoint_lsn;
+
+	MemSet(&tag, 0, sizeof(tag));
+	tag.spcOid = 30;
+	tag.dbOid = 31;
+	tag.relNumber = 32;
+	tag.forkNum = MAIN_FORKNUM;
+	polar_logindex_snapshot_init(logindex_snapshot, LSN_TEST_STEP, 1, false, false);
+	polar_logindex_set_start_lsn(logindex_snapshot, LSN_TEST_STEP);
+
+	for (tid = 1; tid <= tables + 1; tid++)
+	{
+		tag.blockNum = tid;
+		polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+							  ((XLogRecPtr) tid << 32) + LSN_TEST_STEP);
+	}
+
+	for (tid = 1; tid <= tables; tid++)
+	{
+		table = LOG_INDEX_MEM_TBL((tid - 1) % logindex_snapshot->mem_tbl_size);
+		LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+		if (tid % 2)
+			log_index_force_save_table(logindex_snapshot, table);
+		else
+			Assert(log_index_write_table(logindex_snapshot, table, &seg_fd));
+		Assert(LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_FLUSHED);
+		LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+
+		/* Every named table is readable even before the metadata is published. */
+		Assert(log_index_read_table_data(logindex_snapshot, disk_table, tid, LOG));
+		Assert(disk_table->idx_table_id == tid);
+		Assert(test_published_tid(logindex_snapshot) ==
+			   (tid / LOG_INDEX_TABLE_NUM_PER_FILE) * LOG_INDEX_TABLE_NUM_PER_FILE);
+
+		if (tid == 2)
+			test_logindex_refresh_race(logindex_snapshot);
+
+		if (tid == 1)
+			Assert(polar_get_logindex_snapshot_storage_min_lsn(logindex_snapshot) ==
+				   ((XLogRecPtr) 1 << 32) + LSN_TEST_STEP);
+
+		/* A refresh must not discard this bloom or its dirty neighbor. */
+		polar_logindex_invalid_bloom_cache(logindex_snapshot, tid, false);
+		bloom = log_index_get_tbl_bloom(logindex_snapshot, tid);
+		Assert(bloom->idx_table_id == tid);
+		LWLockRelease(SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl,
+										 LOG_INDEX_TBL_BLOOM_PAGE_NO(tid)));
+	}
+	if (seg_fd.fd >= 0)
+		FileClose(seg_fd.fd);
+
+	/* No inactive tables remain; a background round must still publish. */
+	Assert(polar_logindex_bg_write(logindex_snapshot));
+	Assert(test_published_tid(logindex_snapshot) == tables);
+
+	/* Force an eviction/readback of the published bloom page. */
+	polar_logindex_invalid_bloom_cache(logindex_snapshot, tables, false);
+	bloom = log_index_get_tbl_bloom(logindex_snapshot, tables);
+	Assert(bloom->idx_table_id == tables);
+	LWLockRelease(SimpleLruGetBankLock(&logindex_snapshot->bloom_ctl,
+										 LOG_INDEX_TBL_BLOOM_PAGE_NO(tables)));
+
+	/* An active-table write does not advance the publication watermark. */
+	polar_logindex_flush_table(logindex_snapshot, InvalidXLogRecPtr, true);
+	Assert(test_published_tid(logindex_snapshot) == tables);
+
+	/* A checkpoint must publish the remainder left by a forced save. */
+	tag.blockNum++;
+	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+						  ((XLogRecPtr) (tables + 2) << 32) + LSN_TEST_STEP);
+	table = LOG_INDEX_MEM_TBL(tables % logindex_snapshot->mem_tbl_size);
+	LWLockAcquire(LOG_INDEX_MEM_TBL_LOCK(table), LW_EXCLUSIVE);
+	log_index_force_save_table(logindex_snapshot, table);
+	LWLockRelease(LOG_INDEX_MEM_TBL_LOCK(table));
+	Assert(test_published_tid(logindex_snapshot) == tables);
+	checkpoint_lsn = table->data.max_lsn;
+	polar_logindex_flush_table(logindex_snapshot, checkpoint_lsn, false);
+	Assert(test_published_tid(logindex_snapshot) == tables + 1);
+
+	/* Save one more table before testing reinitialization. */
+	tag.blockNum++;
+	polar_logindex_add_lsn(logindex_snapshot, &tag, InvalidXLogRecPtr,
+						  ((XLogRecPtr) (tables + 3) << 32) + LSN_TEST_STEP);
+	table = LOG_INDEX_MEM_TBL((tables + 1) % logindex_snapshot->mem_tbl_size);
+	checkpoint_lsn = table->data.max_lsn;
+	polar_logindex_flush_table(logindex_snapshot, checkpoint_lsn, false);
+	Assert(test_published_tid(logindex_snapshot) == tables + 2);
+
+	/* Reinitialization must recover the published watermark and table contents. */
+	pg_atomic_write_u32(&logindex_snapshot->state, 0);
+	polar_logindex_snapshot_init(logindex_snapshot, checkpoint_lsn, 1, false, false);
+	Assert(logindex_snapshot->last_published_table_id == tables + 2);
+	Assert(log_index_read_table_data(logindex_snapshot, disk_table, tables + 2, LOG));
+	Assert(disk_table->idx_table_id == tables + 2);
+	test_logindex_bloom_refresh_race(logindex_snapshot);
+	pfree(disk_table);
+}
+
 PG_FUNCTION_INFO_V1(test_logindex);
 /*
  * SQL-callable entry point to perform all tests.
@@ -906,6 +1275,9 @@ test_logindex(PG_FUNCTION_ARGS)
 	test_lsn_iterate_from_invalid(logindex_snapshot);
 	test_force_flush_table(logindex_snapshot);
 
+	/* Publish deferred metadata before simulating a restart without WAL. */
+	polar_logindex_flush_table(logindex_snapshot, InvalidXLogRecPtr, false);
+
 	polar_load_logindex_snapshot_from_storage(logindex_snapshot, LSN_TEST_STEP);
 
 	test_lsn_iterate_from_file(logindex_snapshot, LSN_TEST_STEP * 2);
@@ -913,6 +1285,9 @@ test_logindex(PG_FUNCTION_ARGS)
 		BufferTag	tag;
 
 		test_force_flush_full_table(logindex_snapshot, &tag);
+
+		/* Publish before standing in for a restart, see above */
+		polar_logindex_flush_table(logindex_snapshot, InvalidXLogRecPtr, false);
 
 		pg_atomic_init_u32(&logindex_snapshot->state, 0);
 		polar_logindex_snapshot_init(logindex_snapshot, LSN_TEST_STEP, 1, false, false);
@@ -933,6 +1308,8 @@ test_logindex(PG_FUNCTION_ARGS)
 	kill(bgwriter_pid, SIGTERM);
 	Assert(WaitForBackgroundWorkerShutdown(bgwriter_handle) == BGWH_STOPPED);
 
+	test_logindex_publication();
+
 	MemoryContextReset(polar_logindex_memory_context());
 
 	PG_RETURN_INT32(0);
@@ -943,18 +1320,33 @@ test_logindex_request_shmem_size(void)
 {
 	Size		sz = polar_logindex_redo_shmem_size();
 
+	sz = add_size(sz, polar_logindex_shmem_size(TEST_PUBLICATION_TABLES, 32));
+	sz = add_size(sz, MAXALIGN(sizeof(pg_atomic_uint32)));
+
 	return sz;
 }
 
 void
 test_logindex_shmem_startup(void)
 {
+	bool found;
+
+	refresh_worker_done = ShmemInitStruct("test_logindex_refresh_done",
+										sizeof(pg_atomic_uint32), &found);
+	if (!found)
+		pg_atomic_init_u32(refresh_worker_done, 0);
 	/* Reattach after postmaster crash recovery rebuilds shared memory. */
 	test_logindex_snapshot =
 		polar_logindex_snapshot_shmem_init(LOGINDEX_SNAPSHOT_NAME, 3, 32,
 										   polar_wal_logindex_init_lwlock_array,
 										   LWTRANCHE_WAL_LOGINDEX_BLOOM_LRU_BUFFER, LWTRANCHE_WAL_LOGINDEX_BLOOM_LRU);
 	Assert(test_logindex_snapshot);
+	test_publication_snapshot = polar_logindex_snapshot_shmem_init(
+		"test_logindex_publication", TEST_PUBLICATION_TABLES, 32,
+		polar_fullpage_logindex_init_lwlock_array,
+		LWTRANCHE_FULLPAGE_LOGINDEX_BLOOM_LRU_BUFFER, LWTRANCHE_FULLPAGE_LOGINDEX_BLOOM_LRU);
+	Assert(test_publication_snapshot);
+
 
 	prev_flushable_hook = polar_logindex_table_flushable_hook;
 	polar_logindex_table_flushable_hook = test_logindex_table_flushable;
