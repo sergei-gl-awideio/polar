@@ -59,6 +59,7 @@ extern ReadStream *read_stream_begin_relation(int flags,
 extern Buffer read_stream_next_buffer(ReadStream *stream, void **per_buffer_data);
 extern BlockNumber read_stream_next_block(ReadStream *stream,
 										  BufferAccessStrategy *strategy);
+extern void read_stream_clear_strategy(ReadStream *stream);
 extern void read_stream_reset(ReadStream *stream);
 extern void read_stream_end(ReadStream *stream);
 
