@@ -57,6 +57,7 @@ static void prepare_file_with_length(char *path, ssize_t len);
 static void test_lseek_read_work(int directio_fd, int bufferio_fd);
 static void test_pread_work(int directio_fd, int bufferio_fd);
 static void test_preadv_work(int directio_fd, int bufferio_fd);
+static void test_preadv_error_and_eof(int directio_fd, int bufferio_fd);
 static void test_lseek_write_work(int directio_fd, int bufferio_fd);
 static void test_pwrite_work(int directio_fd, int bufferio_fd);
 static void test_pwritev_work(int directio_fd, int bufferio_fd);
@@ -395,6 +396,72 @@ test_preadv_work(int directio_fd, int bufferio_fd)
 			free(buffer_dio[j]);
 			free(buffer_bio[j]);
 		}
+	}
+
+	test_preadv_error_and_eof(directio_fd, bufferio_fd);
+}
+
+/*
+ * Block-sized, aligned iovecs as md.c issues them: a read error must return
+ * -1 without touching the destination, and a read crossing EOF must return
+ * the bytes up to EOF, filling the iovecs in order like preadv().
+ */
+static void
+test_preadv_error_and_eof(int directio_fd, int bufferio_fd)
+{
+	struct stat directio_st;
+	struct iovec iov_dio[IOVCNT];
+	struct iovec iov_bio[IOVCNT];
+	char	   *buffer_dio[IOVCNT];
+	char	   *buffer_bio[IOVCNT];
+	char		untouched[BLCKSZ];
+	off_t		offset;
+	ssize_t		directio_res;
+	ssize_t		bufferio_res;
+	ssize_t		remaining;
+	int			j;
+
+	MemSet(untouched, 0x5a, BLCKSZ);
+	for (j = 0; j < IOVCNT; j++)
+	{
+		Assert(0 == posix_memalign((void **) &buffer_dio[j], PG_IO_ALIGN_SIZE, BLCKSZ));
+		Assert(0 == posix_memalign((void **) &buffer_bio[j], PG_IO_ALIGN_SIZE, BLCKSZ));
+		MemSet(buffer_dio[j], 0x5a, BLCKSZ);
+		MemSet(buffer_bio[j], 0x5a, BLCKSZ);
+		iov_dio[j].iov_base = buffer_dio[j];
+		iov_bio[j].iov_base = buffer_bio[j];
+		iov_dio[j].iov_len = BLCKSZ;
+		iov_bio[j].iov_len = BLCKSZ;
+	}
+
+	/* An invalid fd makes the underlying pread() fail */
+	Assert(polar_directio_preadv(-1, iov_dio, IOVCNT, 0) == -1);
+	for (j = 0; j < IOVCNT; j++)
+		Assert(0 == memcmp(buffer_dio[j], untouched, BLCKSZ));
+
+	/* Put EOF inside the second iovec, so the third one gets nothing */
+	Assert(0 == polar_stat(directio_file, &directio_st));
+	if (directio_st.st_size > 2 * BLCKSZ)
+	{
+		offset = POLAR_DIRECTIO_ALIGN_DOWN(directio_st.st_size - BLCKSZ - 1);
+		remaining = directio_st.st_size - offset;
+		Assert(remaining > BLCKSZ && remaining < 2 * BLCKSZ);
+
+		directio_res = polar_directio_preadv(directio_fd, iov_dio, IOVCNT, offset);
+		bufferio_res = pg_preadv(bufferio_fd, iov_bio, IOVCNT, offset);
+		Assert(directio_res == remaining);
+		Assert(bufferio_res == remaining);
+		for (j = 0; j < IOVCNT; j++)
+			Assert(0 == memcmp(buffer_dio[j], buffer_bio[j], BLCKSZ));
+		Assert(0 == memcmp(buffer_dio[1] + (remaining - BLCKSZ), untouched,
+						   2 * BLCKSZ - remaining));
+		Assert(0 == memcmp(buffer_dio[2], untouched, BLCKSZ));
+	}
+
+	for (j = 0; j < IOVCNT; j++)
+	{
+		free(buffer_dio[j]);
+		free(buffer_bio[j]);
 	}
 }
 

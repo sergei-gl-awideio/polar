@@ -16,5 +16,12 @@ else
 subdir = src/test/modules/test_polar_directio
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
+
+# polar_vfs.so hides polar_directio_*, so link the backend object directly.
+# It still needs polar_vfs loaded for polar_vfs_debug.
+SHLIB_LINK += $(top_builddir)/src/polar_vfs/polar_directio_srv.o
+REGRESS_OPTS = --temp-config $(srcdir)/test_directio.conf
+NO_INSTALLCHECK = 1
+
 include $(top_srcdir)/contrib/contrib-global.mk
 endif

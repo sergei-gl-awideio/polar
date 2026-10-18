@@ -324,7 +324,7 @@ ssize_t
 polar_directio_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
 	int			i;
-	size_t		part = 0;
+	ssize_t		part = 0;
 	ssize_t		bytes_read = 0;
 	void	   *buf = NULL;
 
@@ -347,21 +347,22 @@ polar_directio_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 	{
 		char	   *src = (char *) buf;
 
-		part = pread(fd, buf, bytes_read, offset);
+		/* buf is aligned, but offset and length may not be */
+		part = polar_directio_pread(fd, buf, bytes_read, offset);
 		bytes_read = 0;
 		if (part < 0)
 		{
 			aligned_free(buf);
 			return -1;
 		}
-		for (i = 0; i < iovcnt; ++i)
+		/* Like preadv(), fill the iovecs in order, the last one partially */
+		for (i = 0; i < iovcnt && bytes_read < part; ++i)
 		{
-			if (part >= bytes_read + iov[i].iov_len)
-			{
-				memcpy((char *) iov[i].iov_base, src, iov[i].iov_len);
-				bytes_read += iov[i].iov_len;
-				src += iov[i].iov_len;
-			}
+			size_t		cplen = Min(iov[i].iov_len, part - bytes_read);
+
+			memcpy((char *) iov[i].iov_base, src, cplen);
+			bytes_read += cplen;
+			src += cplen;
 		}
 		aligned_free(buf);
 	}
