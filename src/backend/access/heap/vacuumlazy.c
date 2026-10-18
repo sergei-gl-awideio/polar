@@ -55,6 +55,7 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "storage/read_stream.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
@@ -229,8 +230,9 @@ typedef struct LVSavedErrInfo
 
 /* non-export function prototypes */
 static void lazy_scan_heap(LVRelState *vacrel);
-static bool heap_vac_scan_next_block(LVRelState *vacrel, BlockNumber *blkno,
-									 bool *all_visible_according_to_vm);
+static BlockNumber heap_vac_scan_next_block(ReadStream *stream,
+											void *callback_private_data,
+											void *per_buffer_data);
 static void find_next_unskippable_block(LVRelState *vacrel, bool *skipsallvis);
 static bool lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf,
 								   BlockNumber blkno, Page page,
@@ -815,11 +817,10 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 static void
 lazy_scan_heap(LVRelState *vacrel)
 {
+	ReadStream *stream;
 	BlockNumber rel_pages = vacrel->rel_pages,
-				blkno,
+				blkno = 0,
 				next_fsm_block_to_vacuum = 0;
-	bool		all_visible_according_to_vm;
-
 	Buffer		vmbuffer = InvalidBuffer;
 	const int	initprog_index[] = {
 		PROGRESS_VACUUM_PHASE,
@@ -840,20 +841,24 @@ lazy_scan_heap(LVRelState *vacrel)
 	vacrel->next_unskippable_allvis = false;
 	vacrel->next_unskippable_vmbuffer = InvalidBuffer;
 
-	while (heap_vac_scan_next_block(vacrel, &blkno, &all_visible_according_to_vm))
+	/* Set up the read stream for vacuum's first pass through the heap */
+	stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE,
+										vacrel->bstrategy,
+										vacrel->rel,
+										MAIN_FORKNUM,
+										heap_vac_scan_next_block,
+										vacrel,
+										sizeof(bool));
+
+	while (true)
 	{
 		Buffer		buf;
 		Page		page;
+		bool		all_visible_according_to_vm;
 		int			ndeleted = 0;
 		bool		has_lpdead_items;
+		void	   *per_buffer_data = NULL;
 		bool		got_cleanup_lock = false;
-
-		vacrel->scanned_pages++;
-
-		/* Report as block scanned, update error traceback information */
-		pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_SCANNED, blkno);
-		update_vacuum_error_info(vacrel, NULL, VACUUM_ERRCB_PHASE_SCAN_HEAP,
-								 blkno, InvalidOffsetNumber);
 
 		vacuum_delay_point();
 
@@ -866,7 +871,8 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * one-pass strategy, and the two-pass strategy with the index_cleanup
 		 * param set to 'off'.
 		 */
-		if (vacrel->scanned_pages % FAILSAFE_EVERY_PAGES == 0)
+		if (vacrel->scanned_pages > 0 &&
+			vacrel->scanned_pages % FAILSAFE_EVERY_PAGES == 0)
 			lazy_check_wraparound_failsafe(vacrel);
 
 		/*
@@ -898,10 +904,11 @@ lazy_scan_heap(LVRelState *vacrel)
 
 			/*
 			 * Vacuum the Free Space Map to make newly-freed space visible on
-			 * upper-level FSM pages.  Note we have not yet processed blkno.
+			 * upper-level FSM pages. Note that blkno is the previously
+			 * processed block.
 			 */
 			FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum,
-									blkno);
+									blkno + 1);
 			next_fsm_block_to_vacuum = blkno;
 
 			/* Report that we are once again scanning the heap */
@@ -909,16 +916,30 @@ lazy_scan_heap(LVRelState *vacrel)
 										 PROGRESS_VACUUM_PHASE_SCAN_HEAP);
 		}
 
+		buf = read_stream_next_buffer(stream, &per_buffer_data);
+
+		/* The relation is exhausted. */
+		if (!BufferIsValid(buf))
+			break;
+
+		all_visible_according_to_vm = *((bool *) per_buffer_data);
+		CheckBufferIsPinnedOnce(buf);
+		page = BufferGetPage(buf);
+		blkno = BufferGetBlockNumber(buf);
+
+		vacrel->scanned_pages++;
+
+		/* Report as block scanned, update error traceback information */
+		pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_SCANNED, blkno);
+		update_vacuum_error_info(vacrel, NULL, VACUUM_ERRCB_PHASE_SCAN_HEAP,
+								 blkno, InvalidOffsetNumber);
+
 		/*
 		 * Pin the visibility map page in case we need to mark the page
 		 * all-visible.  In most cases this will be very cheap, because we'll
 		 * already have the correct page pinned anyway.
 		 */
 		visibilitymap_pin(vacrel->rel, blkno, &vmbuffer);
-
-		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 vacrel->bstrategy);
-		page = BufferGetPage(buf);
 
 		/*
 		 * We need a buffer cleanup lock to prune HOT chains and defragment
@@ -1028,8 +1049,12 @@ lazy_scan_heap(LVRelState *vacrel)
 	if (BufferIsValid(vmbuffer))
 		ReleaseBuffer(vmbuffer);
 
-	/* report that everything is now scanned */
-	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_SCANNED, blkno);
+	/*
+	 * Report that everything is now scanned. We never skip scanning the last
+	 * block in the relation, so we can pass rel_pages here.
+	 */
+	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_SCANNED,
+								 rel_pages);
 
 	/* now we can compute the new value for pg_class.reltuples */
 	vacrel->new_live_tuples = vac_estimate_reltuples(vacrel->rel, rel_pages,
@@ -1044,6 +1069,8 @@ lazy_scan_heap(LVRelState *vacrel)
 		Max(vacrel->new_live_tuples, 0) + vacrel->recently_dead_tuples +
 		vacrel->missed_dead_tuples;
 
+	read_stream_end(stream);
+
 	/*
 	 * Do index vacuuming (call each index's ambulkdelete routine), then do
 	 * related heap vacuuming
@@ -1054,12 +1081,14 @@ lazy_scan_heap(LVRelState *vacrel)
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or
 	 * not there were indexes, and whether or not we bypassed index vacuuming.
+	 * We can pass rel_pages here because we never skip scanning the last
+	 * block of the relation.
 	 */
-	if (blkno > next_fsm_block_to_vacuum)
-		FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum, blkno);
+	if (rel_pages > next_fsm_block_to_vacuum)
+		FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum, rel_pages);
 
 	/* report all blocks vacuumed */
-	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_VACUUMED, blkno);
+	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_VACUUMED, rel_pages);
 
 	/* Do final index cleanup (call each index's amvacuumcleanup routine) */
 	if (vacrel->nindexes > 0 && vacrel->do_index_cleanup)
@@ -1067,28 +1096,40 @@ lazy_scan_heap(LVRelState *vacrel)
 }
 
 /*
- *	heap_vac_scan_next_block() -- get next block for vacuum to process
+ *	heap_vac_scan_next_block() -- read stream callback to get the next block
+ *	for vacuum to process
  *
- * lazy_scan_heap() calls here every time it needs to get the next block to
- * prune and vacuum.  The function uses the visibility map, vacuum options,
- * and various thresholds to skip blocks which do not need to be processed and
- * sets blkno to the next block to process.
+ * Every time lazy_scan_heap() needs a new block to process during its first
+ * phase, it invokes read_stream_next_buffer() with a stream set up to call
+ * heap_vac_scan_next_block() to get the next block.
  *
- * The block number and visibility status of the next block to process are set
- * in *blkno and *all_visible_according_to_vm.  The return value is false if
- * there are no further blocks to process.
+ * heap_vac_scan_next_block() uses the visibility map, vacuum options, and
+ * various thresholds to skip blocks which do not need to be processed and
+ * returns the next block to process or InvalidBlockNumber if there are no
+ * remaining blocks.
  *
- * vacrel is an in/out parameter here.  Vacuum options and information about
- * the relation are read.  vacrel->skippedallvis is set if we skip a block
- * that's all-visible but not all-frozen, to ensure that we don't update
- * relfrozenxid in that case.  vacrel also holds information about the next
- * unskippable block, as bookkeeping for this function.
+ * The visibility status of the next block to process is set in the
+ * per_buffer_data.
+ *
+ * callback_private_data contains a reference to the LVRelState, passed to the
+ * read stream API during stream setup. The LVRelState is an in/out parameter
+ * here (locally named `vacrel`). Vacuum options and information about the
+ * relation are read from it. vacrel->skippedallvis is set if we skip a block
+ * that's all-visible but not all-frozen (to ensure that we don't update
+ * relfrozenxid in that case). vacrel also holds information about the next
+ * unskippable block -- as bookkeeping for this function.
+ *
+ * The stream calls this ahead of the block lazy_scan_heap() is processing, so
+ * vacrel->current_block is the last block handed to the stream, not the block
+ * being processed.
  */
-static bool
-heap_vac_scan_next_block(LVRelState *vacrel, BlockNumber *blkno,
-						 bool *all_visible_according_to_vm)
+static BlockNumber
+heap_vac_scan_next_block(ReadStream *stream,
+						 void *callback_private_data,
+						 void *per_buffer_data)
 {
 	BlockNumber next_block;
+	LVRelState *vacrel = callback_private_data;
 
 	/* relies on InvalidBlockNumber + 1 overflowing to 0 on first call */
 	next_block = vacrel->current_block + 1;
@@ -1101,8 +1142,7 @@ heap_vac_scan_next_block(LVRelState *vacrel, BlockNumber *blkno,
 			ReleaseBuffer(vacrel->next_unskippable_vmbuffer);
 			vacrel->next_unskippable_vmbuffer = InvalidBuffer;
 		}
-		*blkno = vacrel->rel_pages;
-		return false;
+		return InvalidBlockNumber;
 	}
 
 	/*
@@ -1151,9 +1191,9 @@ heap_vac_scan_next_block(LVRelState *vacrel, BlockNumber *blkno,
 		 * but chose not to.  We know that they are all-visible in the VM,
 		 * otherwise they would've been unskippable.
 		 */
-		*blkno = vacrel->current_block = next_block;
-		*all_visible_according_to_vm = true;
-		return true;
+		vacrel->current_block = next_block;
+		*((bool *) per_buffer_data) = true;
+		return vacrel->current_block;
 	}
 	else
 	{
@@ -1163,9 +1203,9 @@ heap_vac_scan_next_block(LVRelState *vacrel, BlockNumber *blkno,
 		 */
 		Assert(next_block == vacrel->next_unskippable_block);
 
-		*blkno = vacrel->current_block = next_block;
-		*all_visible_according_to_vm = vacrel->next_unskippable_allvis;
-		return true;
+		vacrel->current_block = next_block;
+		*((bool *) per_buffer_data) = vacrel->next_unskippable_allvis;
+		return vacrel->current_block;
 	}
 }
 
