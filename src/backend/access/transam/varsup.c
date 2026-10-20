@@ -107,6 +107,14 @@ GetNewTransactionId(bool isSubXact)
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign TransactionIds during recovery");
 
+	/*
+	 * Zero the next CSNLOG batch before taking XidGenLock, so that
+	 * polar_csnlog_extend() rarely has I/O to do while holding it.  An
+	 * unlocked read of nextXid is good enough, it is only a hint.
+	 */
+	if (polar_csn_enable)
+		polar_csnlog_extend_ahead(XidFromFullTransactionId(TransamVariables->nextXid));
+
 	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 
 	full_xid = TransamVariables->nextXid;

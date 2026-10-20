@@ -61,6 +61,7 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "port/atomics.h"
+#include "utils/faultinjector.h"
 #include "utils/guc.h"
 
 /*
@@ -96,6 +97,18 @@
 /* We allocate new log pages in batches */
 #define BATCH_SIZE 128
 
+/* Number of pages in the whole (wrapping) CSNLOG page space */
+#define CSNLOG_MAX_PAGES	(TransactionIdToPageNo(MaxTransactionId) + 1)
+
+#define InvalidCSNLogBatch	PG_UINT32_MAX
+
+/* polar_csnlog_zeroed_batch stores page numbers in a uint32 */
+StaticAssertDecl(CSNLOG_MAX_PAGES < PG_UINT32_MAX,
+				 "CSNLOG page numbers must fit in uint32");
+/* Batches tile the page space, so zeroing ahead can wrap to page 0 */
+StaticAssertDecl(CSNLOG_MAX_PAGES % BATCH_SIZE == 0,
+				 "CSNLOG page space must be a multiple of BATCH_SIZE");
+
 #define CSNLOG_DIR                   "pg_csnlog"
 
 /* POLAR: Check whether csnlog local file cache is enabled */
@@ -111,8 +124,18 @@ static SlruCtlData polar_csnlog_ctl;
  */
 static char *polar_upperbound_csn_ptr;
 
+/*
+ * First page of the newest batch zeroed by polar_csnlog_extend() or
+ * polar_csnlog_extend_ahead() during normal operation, or InvalidCSNLogBatch
+ * if there is none yet.  Changed only while holding CSNLogExtendLock.  Page
+ * numbers are below CSNLOG_MAX_PAGES (2^22), so uint32 holds them and never
+ * collides with InvalidCSNLogBatch.
+ */
+static pg_atomic_uint32 *polar_csnlog_zeroed_batch;
+
 static bool polar_csnlog_page_precedes(int64 page1, int64 page2);
 static int	polar_csnlog_zero_page(int pageno);
+static void polar_csnlog_zero_batch(int pageno, bool write_wal);
 static void polar_csnlog_set_csn_by_page(TransactionId xid, int nsubxids,
 										 TransactionId *subxids, CommitSeqNo csn,
 										 XLogRecPtr lsn, int pageno);
@@ -900,6 +923,7 @@ polar_csnlog_shmem_size(void)
 	Size		size;
 
 	size = SimpleLruShmemSize(polar_csnlog_shmem_buffers(), CSNLOG_LSNS_PER_PAGE);
+	size = add_size(MAXALIGN(size), sizeof(pg_atomic_uint32));
 
 	if (polar_csnlog_upperbound_enable)
 		size = add_size(MAXALIGN(size), polar_csnlog_upperbound_csn_shmem_size());
@@ -915,10 +939,14 @@ void
 polar_csnlog_shmem_init(void)
 {
 	SlruCtl		csnlog_ctl = polar_csnlog_get_ctl();
+	bool		found;
+
+	polar_csnlog_zeroed_batch = ShmemInitStruct("CSNLOG zeroed batch", sizeof(pg_atomic_uint32), &found);
+	if (!found)
+		pg_atomic_init_u32(polar_csnlog_zeroed_batch, InvalidCSNLogBatch);
 
 	if (polar_csnlog_upperbound_enable)
 	{
-		bool		found;
 		Size		size = polar_csnlog_upperbound_csn_shmem_size();
 
 		polar_upperbound_csn_ptr = ShmemInitStruct("CSN upperbound shared", size, &found);
@@ -1186,17 +1214,78 @@ polar_csnlog_checkpoint(void)
 
 
 /*
+ * Zero the batch of CSNLOG pages starting at pageno.
+ *
+ * Zeroing may have to write out dirty pages to make room, which can in turn
+ * flush local cache segments to shared storage.
+ *
+ * With write_wal, we WAL-log the batch first and hold DELAY_CHKPT_START until
+ * all its pages are zeroed.  Otherwise a checkpoint could take its redo point
+ * after the record but write out only part of the batch, and recovery from it
+ * (hot standby replays commits into CSNLOG) would read the missing pages from
+ * a short segment file.  polar_csnlog_extend_ahead() runs without XidGenLock,
+ * which is what kept checkpoints from getting that far before.
+ *
+ * As in RecordTransactionCommit(), only we write our delayChkptFlags, and the
+ * WAL insertion orders setting the flag before the record.  A checkpoint that
+ * already has its redo point when we insert the record doesn't need to wait
+ * for us: recovery from it replays the record.
+ */
+static void
+polar_csnlog_zero_batch(int pageno, bool write_wal)
+{
+	SlruCtl		csnlog_ctl = polar_csnlog_get_ctl();
+	int			delay_flags = 0;
+	int			i;
+
+	Assert(pageno % BATCH_SIZE == 0);
+
+	if (write_wal)
+	{
+		delay_flags = MyProc->delayChkptFlags;
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	}
+
+	/*
+	 * Zeroing can fail with an I/O error.  Transaction abort clears
+	 * delayChkptFlags, but subtransaction abort does not, so a caught error
+	 * would block checkpoints until the top transaction ends.
+	 */
+	PG_TRY();
+	{
+		if (write_wal)
+			polar_csnlog_write_zero_page_xlog_rec(pageno);
+
+		for (i = pageno; i < pageno + BATCH_SIZE; i++)
+		{
+			LWLock	   *lock = SimpleLruGetBankLock(csnlog_ctl, i);
+
+			SIMPLE_FAULT_INJECTOR("polar_csnlog_zero_batch_page");
+
+			LWLockAcquire(lock, LW_EXCLUSIVE);
+			polar_csnlog_zero_page(i);
+			LWLockRelease(lock);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (write_wal)
+			MyProc->delayChkptFlags = delay_flags;
+	}
+	PG_END_TRY();
+}
+
+/*
  * Make sure that CSNLOG has room for a newly-allocated XID.
  *
  * NB: this is called while holding XidGenLock.  We want it to be very fast
- * most of the time; even when it's not so fast, no actual I/O need happen
- * unless we're forced to write out a dirty csnlog page to make room
- * in shared memory.
+ * most of the time.  During normal operation (write_wal), the batch has
+ * usually been zeroed already by polar_csnlog_extend_ahead(); otherwise we
+ * zero it here, which may involve I/O and stalls all XID assignment.
  */
 void
 polar_csnlog_extend(TransactionId newestXact, bool write_wal)
 {
-	int			i;
 	int			pageno;
 
 	/*
@@ -1212,19 +1301,63 @@ polar_csnlog_extend(TransactionId newestXact, bool write_wal)
 	if (pageno % BATCH_SIZE)
 		return;
 
-	if (write_wal)
-		polar_csnlog_write_zero_page_xlog_rec(pageno);
-
-	/* Zero the page */
-	for (i = pageno; i < pageno + BATCH_SIZE; i++)
+	if (!write_wal)
 	{
-		SlruCtl		csnlog_ctl = polar_csnlog_get_ctl();
-		LWLock	   *lock = SimpleLruGetBankLock(csnlog_ctl, i);
-
-		LWLockAcquire(lock, LW_EXCLUSIVE);
-		polar_csnlog_zero_page(i);
-		LWLockRelease(lock);
+		polar_csnlog_zero_batch(pageno, false);
+		return;
 	}
+
+	if (pg_atomic_read_u32(polar_csnlog_zeroed_batch) == (uint32) pageno)
+		return;
+
+	/* Wait for a concurrent polar_csnlog_extend_ahead() to finish, if any */
+	LWLockAcquire(CSNLogExtendLock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(polar_csnlog_zeroed_batch) != (uint32) pageno)
+	{
+		polar_csnlog_zero_batch(pageno, true);
+		pg_atomic_write_u32(polar_csnlog_zeroed_batch, pageno);
+	}
+	LWLockRelease(CSNLogExtendLock);
+}
+
+/*
+ * Zero the CSNLOG batch following the one next_xid is on, ahead of time.
+ *
+ * GetNewTransactionId() calls this before taking XidGenLock, so that any I/O
+ * needed for zeroing happens here rather than in polar_csnlog_extend(), where
+ * it would stall all XID assignment.  We start once XID assignment is in the
+ * second half of a batch, which leaves the rest of the batch to finish.
+ *
+ * next_xid is read without XidGenLock and may be stale, so it only decides
+ * when to do the work.  The batch to zero is always the one after
+ * polar_csnlog_zeroed_batch: XIDs on it are handed out only after
+ * polar_csnlog_extend() has seen it zeroed, so none of them can be in use.
+ */
+void
+polar_csnlog_extend_ahead(TransactionId next_xid)
+{
+	int			pageno = TransactionIdToPageNo(next_xid);
+	uint32		zeroed_batch;
+	uint32		next_batch;
+
+	if (pageno % BATCH_SIZE < BATCH_SIZE / 2)
+		return;
+
+	zeroed_batch = pg_atomic_read_u32(polar_csnlog_zeroed_batch);
+	if (zeroed_batch != (uint32) (pageno - pageno % BATCH_SIZE))
+		return;					/* next batch already zeroed, or no base yet */
+
+	/* Someone else is extending; let them */
+	if (!LWLockConditionalAcquire(CSNLogExtendLock, LW_EXCLUSIVE))
+		return;
+
+	if (pg_atomic_read_u32(polar_csnlog_zeroed_batch) == zeroed_batch)
+	{
+		next_batch = (zeroed_batch + BATCH_SIZE) % CSNLOG_MAX_PAGES;
+		polar_csnlog_zero_batch(next_batch, true);
+		pg_atomic_write_u32(polar_csnlog_zeroed_batch, next_batch);
+	}
+	LWLockRelease(CSNLogExtendLock);
 }
 
 void

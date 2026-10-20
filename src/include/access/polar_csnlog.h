@@ -64,6 +64,7 @@ extern TransactionId polar_csnlog_get_top(TransactionId xid);
 extern void polar_csnlog_validate_dir(void);
 extern void polar_csnlog_remove_all(void);
 extern void polar_csnlog_extend(TransactionId newest_xid, bool write_wal);
+extern void polar_csnlog_extend_ahead(TransactionId next_xid);
 extern void polar_csnlog_truncate(TransactionId oldest_xid);
 extern void polar_csnlog_checkpoint(void);
 
